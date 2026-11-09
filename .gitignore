@@ -1,0 +1,4 @@
+# Written by the Herdr app into each mod folder; regenerated on start.
+herdr/mods/*/gpui-kit.d.ts
+herdr/mods/*/jsconfig.json
+.DS_Store
