@@ -149,25 +149,71 @@ plain `hc send`; hc is not modified.
 | Bun AOT: about 6.6 MB footprint, and `bun:ffi` `execvp` works | Bun 1.4.5 canary, measured with `footprint` |
 | Both CLIs accept a first prompt when resuming | `claude [options] [prompt]`, `pi [options] [messages...]` |
 
-## Open facts: check before building
+## Open facts: answers (2026-11-16)
 
-- **F1**: Do kept terminals keep their address and labels after
-  `hc server stop` and the next core start? Test on a disposable core
-  (`HC_TERMINAL_SOCKET` / a separate state folder) so live agents are not
-  touched.
-- **F2**: What does `foreground.argv` show for Claude (Pi hides its own as
-  `["pi","","",""]`)? Does `claude --resume <id> -- "<msg>"` submit the
-  message interactively?
-- **F3**: When fish is the main program and gets `SIGTERM`, is that a loss
-  (keep recovery runs) or a normal exit (the terminal finishes)? If fish
-  exits normally, use `SIGKILL` for shell main programs. Also check that the
-  agent inside then exits cleanly (SIGHUP) with its session saved.
-- **F4**: What error kind and text does `hc get` return while the core is
-  starting? `herdr-shell`'s retry depends on it.
-- **F5**: The exact OSC 7501 report syntax (the binary shows the query
-  `ESC]7501;?` and the answer `]7501;?:states=…`). Confirm `idle`/`working`/
-  `blocked` reports from a probe, and that `hc send --if idle`, `hc wait` and
-  `hc send --wait` treat the stand-in as an idle agent.
+All five facts were checked on a disposable core, hc 0.1.21, Claude Code
+2.1.325, Pi 1.5.2. The setup:
+
+- Session `HC_SESSION=f1`, with `XDG_STATE_HOME`, `XDG_CONFIG_HOME` and
+  `XDG_RUNTIME_DIR` under `/tmp/hcf`, and `HC_TERMINAL_SOCKET`,
+  `HC_TERMINAL_ID` and `HC_SOCKET` unset.
+- Core id `8c957a13…`, socket `/tmp/hcf/run/herdr-core/f1.sock`. The real
+  core is `1897801a…`.
+- The core was started from a throwaway `--rm` terminal (`hcf-*`) on the real
+  core, because a core started inside the agent's sandbox cannot spawn
+  programs (`spawn_failed: Operation not permitted`). That terminal was the
+  only use of the real core.
+- F3 and F5 also ran on the disposable core, not on the real one.
+- Afterwards all disposable terminals were removed and the disposable core
+  was stopped. The real core kept the same pid (60961) and its uptime, and no
+  `hcf-*` terminal was left.
+- The throwaway Claude and Pi sessions are under `~/.claude/projects/-private-tmp-hcf-wd/`
+  and `~/.pi/agent/sessions/--private-tmp-hcf-wd--/`. They were left in place.
+
+| Fact | Answer | Evidence |
+|---|---|---|
+| **F1** server stop/start | **Yes.** Kept terminals keep their address and labels. On the next core start, the configured `shell` starts as the new main program, also in terminals that were already in recovery. | `hc run --bg --keep sleep` as `t3` (with labels `herdr.suspended={…}` and `x.y=1`) and as `t4` (SIGKILLed first, so it was already in its recovery shell). Then `hc server stop` and `hc server start`: `t3` and `t4` were `live`, with the same names and labels, `keep: true`, and new pids running `fish -l`. A second run used `shell = ["/tmp/hcf/probe-shell"]`, and every terminal started the probe shell after the restart. |
+| **F2** Claude argv | **The full argv is visible**, with the prompt in it. `foreground.argv` was `["claude","--model","haiku","--permission-mode","default","--add-dir","/tmp","<prompt>"]` from fish. `foreground.name` is the version (`"2.1.325"`), not `claude`. Pi shows `["pi","",""]`, which hides its words. | `hc get f2 --json` while Claude ran in a fish terminal. Wake shapes seen: `["claude","--model","haiku","--resume","<id>","--","<msg>"]` and `[…,"--","first…\n\nsecond…"]`. |
+| **F2** resume + `--` + message | **Yes.** `claude --resume <id> -- "<msg>"` resumes the session (the old turns are shown) and submits the message interactively as the first prompt. This also works when the message starts with `-`, and when it has several lines in one argument (one prompt). | The screen showed the old `❯ …pong4`, then `❯ …pong5` and a request in progress, with status `working`. The same happened for `-Reply…pong8`, and for a two-paragraph argument started through `exec claude … -- "$(printf 'a\n\nb')"`. Pi gave the same result: `pi --session <file> -- "-Reply…pong7"` resumed and answered `pong7`. |
+| **F2** variadic options | **Claude has variadic options that swallow later words.** `--add-dir <directories...>` took a trailing prompt as a second folder: `claude … --add-dir /tmp "<prompt>"` submitted nothing, and no session file was written. With `--add-dir /tmp -- "<prompt>"`, the prompt was submitted. The variadic options in `claude --help` are `--add-dir`, `--allowedTools`/`--allowed-tools`, `--disallowedTools`/`--disallowed-tools`, `--tools`, `--betas`, `--mcp-config` and `--file`. Options with an optional value are `-r/--resume [value]`, `-d/--debug [filter]`, `-w/--worktree [name]`, `--remote-control [name]`, `--teleport [session]`, `--from-pr [value]`, `--cloud […]` and `--prompt-suggestions [value]`. | Two fresh starts with `--add-dir /tmp "<prompt>"`: the input box was empty and `~/.claude/sessions/<pid>.json` named a session that had no `.jsonl`. The same command with `--` submitted the prompt. |
+| **F2** model not kept by resume | **`--resume` alone does not restore the model.** Without `--model`, the resumed session started with the settings default (`qwen3.5-4b-4bit`) instead of `haiku`. This confirms that Claude needs launch options. | The Claude banner after `claude --resume <id> -- …` |
+| **F3** SIGTERM to a fish main program | **Loss.** hc starts the configured shell in the same terminal (same address, same labels, new pid). `SIGKILL` is not needed. `SIGHUP` and `SIGKILL` also give a loss. `SIGINT` is ignored, and fish keeps running. | Kept fish terminals `t7`–`t10` with label `probe=1`. TERM: pid 4345 became 4921. HUP: 5166 became 5208. KILL: 5280 became 5343. INT: still 5225. All stayed `live`, `keep: true`, with their labels. |
+| **F3** agent inside fish | **The agent exits cleanly with its session saved.** Claude (idle, in fish) exited about 600 ms after SIGTERM to fish. It wrote a final `cost-state` line, every line stayed valid JSON, it removed `~/.claude/sessions/<pid>.json`, and `--resume <id>` showed the old turns. Pi (`done`, in fish) exited within 250 ms. Its session file stayed complete (all lines valid JSON, with the `pong6` answer), and the `herdr.pi-recovery` label was kept. | `kill -TERM <fish pid>`, then `ps -p <agent pid>`, and the session files read afterwards. |
+| **F4** `hc get` while the core starts | **`hc get` never failed while the core was starting.** It waits for a starting core, and it starts a stopped core itself. Racing 30 to 60 `hc get` calls against `hc server start`, `hc server stop` and the autostart gave no error. Recovery shells started by a core start got an answer on the first try, about 25 ms after they started. The only failure seen was during `hc server restart`: exit code **5**, `{"error":{"kind":"unavailable","message":"the core restarted while this ran (an update?)","hint":"run the command again; terminals kept running"}}`. `herdr-shell` must retry on exit 5 / `kind: unavailable`. Any other error (for example `not_found`, exit 3) is not retryable, and the launcher must not start a shell for it. | The race loops in `/tmp/hcf/f4*.sh`. `/tmp/hcf/probe-shell` (as the configured `shell`) logged `t3`–`t6 try 1 rc=0` 25 ms after it started. `hc` ignores `HC_TERMINAL_SOCKET` (a dead path still reached the core): it finds the core from `HC_SESSION`, `HC_SOCKET` and the XDG paths, which recovery shells inherit from the core. |
+| **F5** report syntax | `ESC ] 7501 ; state=<idle\|working\|done\|blocked\|error>[:app=<[A-Za-z0-9_.+-]{1,32}>][:kind=<permission\|question\|auth>][:msg=<base64 UTF-8>] ESC \`. Use `kind` only with `blocked`. The query `ESC]7501;?ESC\` gets the answer `ESC]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth`. | Pi's `pi-tui/dist/program-status.js` (`formatProgramStatus`). A Python probe that sends these reports showed `status: {app: "probe", state: …, msg: …}` in `hc get`. |
+| **F5** coordination commands | **A program that reports `idle` counts as an idle agent.** `hc send --if idle` delivers (`started: true`). `hc wait` returns `reason: status, status: idle` when the probe goes back to idle, and `turn` goes up. `hc send --wait` returns after the turn, with `wait.status: idle`. This is the same when the probe is the main program of `hc run` and when it is a kept terminal's configured `shell`, started after a SIGKILL. While the probe is `blocked`, both `hc send` and `hc send --if idle` refuse with exit 9 (`kind: blocked`), and `hc wait` returns at once with `status: blocked`. A program that never reported is `silent`, and `hc send --if idle` refuses it with exit 10 (`status_mismatch`, "t1g is silent, not idle"). | `/tmp/hcf/f5.sh` on `f5a` (`hc run`) and on `f5b` (the probe as the `shell`). |
+| **F5** extras for the stand-in | (1) When the program has bracketed paste on, `hc send` writes `ESC[200~<text>ESC[201~`, then `\r` about 200 ms later in a separate read. (2) A blocked child makes hc paste `<hc>t1k f5c is blocked (question). See: hc read t1k</hc>` into its parent. (3) After `execvp`, the last report stays: `working` stayed in place under `sleep` (same pid) until the new program reported. This supports "waking…". | The probe's input log, and a parent probe `t1j` with a child probe `t1k`. |
+
+### Contradictions with the spec
+
+None of the five facts contradicts an agreed decision:
+
+- SIGTERM stays the signal for both kinds of main program. The F3 escape
+  hatch (SIGKILL) is not needed.
+- F1 confirms user story 46.
+- F4 refines the launcher's retry: retry on exit 5 / `unavailable`.
+- F5 confirms the stand-in's reports.
+
+Three points need attention in later tickets. None of them changes a spec
+decision:
+
+1. **Ticket 03 (Claude launch options).** The argv contains the prompt, so
+   the allow-list is required. For variadic options, Claude itself takes the
+   words up to the next option as values, so `--add-dir /x "<prompt>"` means
+   a folder named `<prompt>`. A parser that copies Claude's arity would store
+   that text in the label. Safer choices: drop the variadic options, or keep
+   their values only when the next word is an option or `--`. Options with an
+   optional value (`--resume`, `--debug`, `--worktree` and the others listed
+   above) must stop capture or be dropped. Because the wake command always
+   puts `--` before the messages, recorded variadic options cannot swallow the
+   messages.
+2. **Ticket 05 (`herdr-shell`).** Retry only on exit code 5 (`kind:
+   unavailable`). Never fall back to `$SHELL` on another error. A stopped core
+   is never seen, because `hc get` starts the core itself.
+3. **Not verified:** whether a first-run Claude dialog shown during a wake
+   (folder trust, or the "fullscreen renderer" offer) drops the first prompt.
+   Such a dialog would report `blocked`, and hc would tell the parent.
+   Folders that already have a session are trusted already.
 
 ## Tasks
 
