@@ -14,11 +14,23 @@
 
 **Blocked by:** 14 (done).
 
-**Status:** ready-for-agent
+Status: done
 
-- [ ] `root=agent` suspension sends `SIGKILL` to the main program, then `SIGTERM` to the helpers from its snapshot. `root=shell` still sends `SIGTERM` to the shell. Tests cover both.
-- [ ] A Claude session without a transcript, and a Pi record whose file doesn't hold the session, are not resumable.
-- [ ] The last-agent label is never set from a stand-in.
-- [ ] A background job in the hosting shell blocks suspension.
-- [ ] The installed check is cached; old requests are pruned; 💤 never shows on a live agent; the comments are fixed.
-- [ ] No new periodic timer (the timer list stays [3000, 10000, 15000]). The full test suite passes.
+- [x] `root=agent` suspension sends `SIGKILL` to the main program, then `SIGTERM` to the helpers from its snapshot. `root=shell` still sends `SIGTERM` to the shell. Tests cover both.
+- [x] A Claude session without a transcript, and a Pi record whose file doesn't hold the session, are not resumable.
+- [x] The last-agent label is never set from a stand-in.
+- [x] A background job in the hosting shell blocks suspension.
+- [x] The installed check is cached; old requests are pruned; 💤 never shows on a live agent; the comments are fixed.
+- [x] No new periodic timer (the timer list stays [3000, 10000, 15000]). The full test suite passes.
+
+## Comments
+
+Done in 8b086cd (implementation) and b33ee87 (review fixes).
+
+- C1: root=agent sends SIGKILL to the main program, then SIGTERM to every process under the agent in the step-1 process snapshot (the reviewer noted that wrappers like uvx may not pass SIGTERM on). If the SIGKILL fails, no helper gets a signal. root=shell still sends SIGTERM to the shell.
+- H1/M1: a new slow rule (it starts a process) after the cheap rules: Claude needs `~/.claude/projects/*/<id>.jsonl`, and Pi needs a session file whose header holds the recorded session (`piSessionHeld`, shared with recovery in resume.js). The pass skips the slow rules. When a suspension is refused with "not-resumable", the pass holds the agent back for 5 minutes, as it does for "background" (manual requests check again at once).
+- M4: for root=shell, every child of the hosting shell except the one that leads to the agent must be a helper.
+- M3: `remember()` skips a stand-in report and any terminal with the suspension label. L8: 💤 shows only while the stand-in or herdr-shell is in front (`holderInFront`). ↻ stays hidden while the label is set.
+- L3: the pass checks the installation at most every 5 minutes, and each suspension still checks it. L7: the leader's pass removes requests that can no longer act. L11: the tab-menu state comment and the wake wording are fixed.
+- Tests: `node --test tests/*.test.mjs` passes 301 of 301, and `sh tests/install.test.sh` passes. The timer list is still [3000, 10000, 15000].
+- Open: the L7 prune writes the whole requests key. If another mod's `setShared` is not visible yet in this mod's `shared()`, a "Suspend now" request made at that moment can be lost, and the menu then says "no answer" after a minute. The herdr-app docs do not say whether that write is visible at once across mods. Also, `herdr-app check` could not run in this sandbox (launchd bootstrap error).
