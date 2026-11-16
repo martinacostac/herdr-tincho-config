@@ -9,11 +9,22 @@ Manual suspension works also when automatic suspension is turned off.
 
 **Blocked by:** 07 (manual suspension entry point and reasons)
 
-**Status:** ready-for-agent
+Status: done
 
-- [ ] Agent tabs show Suspend now and Never suspend; other tabs, panes, spaces and remote terminals do not show them
-- [ ] Suspend now on an eligible agent requests the suspension
-- [ ] Suspend now on an ineligible agent shows the failing rule, for each reason in the list
-- [ ] Never suspend sets the pin, and the item then offers to remove it
-- [ ] Tests with a mocked host cover the items, the reasons and the pin toggle
-- [ ] Only the tab-menu mod changes
+- [x] Agent tabs show Suspend now and Never suspend; other tabs, panes, spaces and remote terminals do not show them
+- [x] Suspend now on an eligible agent requests the suspension
+- [x] Suspend now on an ineligible agent shows the failing rule, for each reason in the list
+- [x] Never suspend sets the pin, and the item then offers to remove it
+- [x] Tests with a mocked host cover the items, the reasons and the pin toggle
+- [x] Only the tab-menu mod changes
+
+## Comments
+
+Done in 7c4dc7d (implementation and tests) and a8ced3f (review fixes).
+
+- herdr/mods/tab-menu/main.js: agent tabs on this machine (program.agent, an agent report, or the `herdr.suspended` label) get **Suspend now** and **Never suspend**. Plain tabs, panes, spaces, the global menu and remote terminals do not get them.
+- Suspend now merges `{[address]: Date.now()}` into `tincho.suspend.requests`. The menu stays open: "Suspending…" until `results[address].requested >= at`, then "Suspended" or "Can't suspend: <reason>". After 60 s (REQUEST_MS) with no result, the item shows "no answer from tab tree". This is checked on render, with no timer. A pending request is not sent again.
+- Before a request, the item shows "Can't suspend: <reason>" from the labels (suspended, pinned) and from `agents[address].manual`. The item stays clickable, so the rules are checked again. Every policy reason has its own text. An unknown reason shows as its own word.
+- Never suspend runs `hc label <t> herdr.never-suspend=1`. When the agent is pinned, the item reads "Remove Never suspend" and runs `hc label <t> herdr.never-suspend=`. A failed change posts an error notification.
+- tests/tab-menu.test.mjs: 14 tests with a mocked Herdr host and UI kit.
+- Open: the tab popup height (200 px in tab-tree/main.js) clips the last item. Ticket 08 changes it to 270, as agreed with t4.
