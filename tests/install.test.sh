@@ -512,55 +512,43 @@ assert_same "$case_dir/expected" "$config/herdr-core/config.toml"
 assert_absent "$core"
 echo 'ok - the herdr-core config follows XDG_CONFIG_HOME'
 
-wait_same() {
+# watch_until <what> <command...>: runs the command every 0.1 s until it
+# succeeds, for up to 10 s, and fails if the watcher exits meanwhile.
+watch_until() {
+  what=$1; shift
   attempts=0
-  until cmp -s "$1" "$2"; do
+  until "$@"; do
     attempts=$((attempts + 1))
-    [ "$attempts" -lt 100 ] || fail "watch did not update $2"
+    [ "$attempts" -lt 100 ] || fail "watch did not $what"
     kill -0 "$watch_pid" 2>/dev/null || fail 'watch exited'
     sleep 0.1
   done
 }
-wait_log() {
-  attempts=0
-  until grep -F "$1" "$log" >/dev/null; do
-    attempts=$((attempts + 1))
-    [ "$attempts" -lt 100 ] || fail "watch did not report $1"
-    kill -0 "$watch_pid" 2>/dev/null || fail 'watch exited'
-    sleep 0.1
-  done
-}
-# A fake sleep first on PATH for --watch: it records each poll's sleep in
-# $sleeps. install.sh exits when a source file disappears while a pass copies
-# it, so a test renames or removes sources only between passes. wait_idle
-# waits for two new sleeps: the second starts after a pass that saw every
-# earlier change, so no pass is running or due until the next change.
-real_sleep=$(command -v sleep)
-# watch_sleep <path>: sets watch_path to that PATH with the fake sleep first.
-watch_sleep() {
+wait_same() { watch_until "update $2" cmp -s "$1" "$2"; }
+wait_log() { watch_until "report $1" grep -F "$1" "$log" >/dev/null; }
+# start_watch <PATH>: starts `install.sh --watch` with that PATH and sets
+# watch_pid. A fake sleep goes first on its PATH and records each poll's sleep
+# in $sleeps (install.sh sleeps only between polls). install.sh exits when a
+# source file disappears while a pass copies it, so a test renames or removes
+# sources only between passes: wait_idle waits for two new sleeps. The second
+# starts after a pass that saw every earlier change, so no pass runs or is
+# due until the next change.
+start_watch() {
   sleeps="$case_dir/sleeps"
   mkdir -p "$case_dir/watch-bin"
   : > "$sleeps"
-  printf '#!/bin/sh\necho >> "%s"\nexec "%s" "$@"\n' "$sleeps" "$real_sleep" > "$case_dir/watch-bin/sleep"
+  printf '#!/bin/sh\necho >> "%s"\nexec "%s" "$@"\n' "$sleeps" "$(command -v sleep)" > "$case_dir/watch-bin/sleep"
   chmod +x "$case_dir/watch-bin/sleep"
-  watch_path="$case_dir/watch-bin:$1"
+  # exec avoids leaving the watched installer behind when the test kills its pid.
+  (exec env -i PATH="$case_dir/watch-bin:$1" HOME="$home" XDG_STATE_HOME="$state" \
+    sh "$repo/install.sh" --watch > "$log" 2>&1) &
+  watch_pid=$!
 }
-wait_idle() {
-  until_sleeps=$(($(wc -l < "$sleeps") + 2))
-  attempts=0
-  until [ "$(wc -l < "$sleeps")" -ge "$until_sleeps" ]; do
-    attempts=$((attempts + 1))
-    [ "$attempts" -lt 300 ] || fail 'watch did not finish its pass'
-    kill -0 "$watch_pid" 2>/dev/null || fail 'watch exited'
-    "$real_sleep" 0.1
-  done
-}
+sleep_count() { wc -l < "$sleeps" | tr -d ' '; }
+slept() { [ "$(sleep_count)" -ge "$1" ]; }
+wait_idle() { watch_until 'finish its pass' slept $(($(sleep_count) + 2)); }
 fixture watch
-watch_sleep "$nobun_path"
-# exec avoids leaving the watched installer behind when the test kills its pid.
-(exec env -i PATH="$watch_path" HOME="$home" XDG_STATE_HOME="$state" \
-  sh "$repo/install.sh" --watch > "$log" 2>&1) &
-watch_pid=$!
+start_watch "$nobun_path"
 wait_log 'pi: 5 installed, 0 skipped'
 printf 'herdr-v2\n' > "$repo/herdr/mods/example/main.js"
 printf 'pi-v2\n' > "$repo/pi/extensions/herdr-recovery/index.ts"
@@ -585,10 +573,7 @@ echo 'ok - watch handles repeated same-size edits and renames in both trees'
 
 fixture watch-conditional
 rmdir "$home/.pi"
-watch_sleep "$nobun_path"
-(exec env -i PATH="$watch_path" HOME="$home" XDG_STATE_HOME="$state" \
-  sh "$repo/install.sh" --watch > "$log" 2>&1) &
-watch_pid=$!
+start_watch "$nobun_path"
 wait_log 'pi: skipped'
 assert_absent "$home/.pi"
 assert_absent "$record/installed-pi"
@@ -609,21 +594,12 @@ wait "$watch_pid" 2>/dev/null || :
 watch_pid=
 echo 'ok - watch activates existing Pi and never recreates a removed Pi home'
 
-wait_builds() {
-  attempts=0
-  until [ "$(build_count)" = "$1" ]; do
-    attempts=$((attempts + 1))
-    [ "$attempts" -lt 100 ] || fail "watch did not reach $1 builds (got $(build_count))"
-    kill -0 "$watch_pid" 2>/dev/null || fail 'watch exited'
-    sleep 0.1
-  done
-}
+built() { [ "$(build_count)" = "$1" ]; }
+wait_builds() { watch_until "reach $1 builds" built "$1"; }
 fixture watch-standin
 suspend_sources
 fake_bun aot
-(exec env -i PATH="$run_path" HOME="$home" XDG_STATE_HOME="$state" \
-  sh "$repo/install.sh" --watch > "$log" 2>&1) &
-watch_pid=$!
+start_watch "$run_path"
 wait_log 'suspend: 2 installed'
 wait_log 'set        shell'
 before=$(inode "$core")

@@ -51,8 +51,9 @@ consolidated below.
   helper processes `SIGTERM` (Pi turns `SIGTERM` into a normal exit, which
   would end the terminal); a shell that hosts an agent gets `SIGTERM`. Claude
   counts as resumable only with its transcript on disk, Pi only with a
-  session file that holds its session; otherwise messages are kept in an
-  `undelivered` file. On macOS, `herdr-shell` and the stand-in start your
+  session file that holds its session; otherwise the agent isn't suspended.
+  A wake that finds the session gone keeps the messages in an `undelivered`
+  file and reports `blocked`. On macOS, `herdr-shell` and the stand-in start your
   shell as a login shell, as hc does.
 - Sidebar 💤 and "waking…" states, and **Suspend now** and **Never suspend**
   items in the tab menu, with the reason when an agent cannot be suspended.

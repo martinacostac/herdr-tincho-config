@@ -385,8 +385,9 @@ How the agent's process ends depends on what hc started in the terminal:
   start) gets `SIGKILL`. Pi turns `SIGTERM` into a normal exit (code 0), and
   hc ends a terminal whose program exits normally, even a kept one; no program
   can turn `SIGKILL` into an exit. Then every process that was under the agent
-  (its MCP servers and their children) gets `SIGTERM`. Pi writes each entry of
-  its session file as it happens, so an idle Pi loses nothing.
+  (its MCP servers and their children) gets `SIGTERM`. Pi 1.5.2 appends each
+  entry to its session file as it happens (`appendFileSync` in its session
+  manager, read in its source), so an idle Pi loses nothing.
   `tests/suspend.integration.sh` checks both signals with a real Pi.
 - **An agent inside your shell**: the shell gets `SIGTERM`. hc counts that as
   a lost program, and the agent exits cleanly with its session saved (fact F3
@@ -457,7 +458,8 @@ command. For a short moment hc has no program in the terminal and
 refuses the send as `unavailable`; the sender can send it again. After that,
 while `herdr-shell` and the stand-in start, hc delivers it: the text waits in
 the terminal's input, and the stand-in reads everything that arrived before
-it was ready as one message, with its lines joined by newlines. When
+it was ready as one message, with its lines joined by newlines (input that
+reaches it in two separate reads can become two messages). When
 `herdr-shell` waits on an error (below), it keeps the lines with text for
 the stand-in.
 
@@ -474,8 +476,9 @@ A woken agent normally reports its status at once. Claude can miss that
 step, and hc would then show the stand-in's `working` report for good, so
 `hc wait` and `hc send --if idle` would treat the agent as busy. Right before
 it starts the agent, the stand-in leaves a small watchdog (`/bin/sh`). It
-reads the terminal once, 30 s later. If hc still shows the stand-in's report
-and the stand-in isn't in front, it reports `idle` for the terminal, once.
+reads the terminal once, 30 s later. If the terminal is live, hc still shows
+the report the stand-in made when the wake began, and the stand-in isn't in front,
+it reports `idle` for the terminal, once.
 In every other case it does nothing. The sidebar stops showing "waking…"
 after the same 30 s.
 
@@ -585,8 +588,8 @@ programs are installed and `herdr-shell` is hc's `shell`.
 - A helper is any process whose command line contains a `helpers` entry, so
   with the default `mcp`, a dev server under a path such as
   `~/projects/mcp-foo/` counts as a helper and doesn't keep its agent awake.
-- Claude started directly by hc (root agent) gets `SIGKILL` like Pi. That it
-  loses nothing then wasn't checked.
+- A Claude that hc started directly gets `SIGKILL` like Pi. That it loses
+  nothing then wasn't checked.
 - The watchdog's `idle` report has no app name. hc shows it until the woken
   agent reports on its own.
 - `./install.sh` and `tab-tree` find the bin folder and herdr-core's config

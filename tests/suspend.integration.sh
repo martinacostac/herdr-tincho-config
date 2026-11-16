@@ -50,7 +50,16 @@ PI=$(command -v pi)
 work=
 core_id=
 core_socket=
+# The wake watchdog (suspend/watchdog.ts) runs `hc get` 30 s after a wake; 2 s
+# more for it to finish. `hc get` starts a stopped core, so the core stops
+# only after the last watchdog ran.
 last_wake=
+wait_watchdogs() {
+  [ -n "$last_wake" ] || return 0
+  left=$((last_wake + 32 - $(date +%s)))
+  if [ "$left" -gt 0 ]; then echo "--- waiting ${left}s for the wake watchdogs"; sleep "$left"; fi
+  last_wake=
+}
 disposable_core() {
   [ -n "$core_id" ] && [ -S "$core_socket" ] && [ "$(hc server status --json 2>/dev/null | json 't.core?.id' 2>/dev/null)" = "$core_id" ]
 }
@@ -58,12 +67,7 @@ cleanup() {
   status=$?
   trap - EXIT HUP INT TERM
   if disposable_core; then
-    # A wake leaves a watchdog that runs `hc get` 30 s later, and `hc get`
-    # starts a stopped core: so the core stops only after it ran.
-    if [ -n "$last_wake" ]; then
-      left=$((last_wake + 32 - $(date +%s)))
-      if [ "$left" -gt 0 ]; then echo "waiting ${left}s for the wake watchdogs"; sleep "$left"; fi
-    fi
+    wait_watchdogs
     for t in $(cat "$work/terminals" 2>/dev/null); do
       hc keep "$t" --off >/dev/null 2>&1 || :
       hc kill "$t" >/dev/null 2>&1 || :
@@ -153,6 +157,7 @@ descendants() {
 }
 # not_helpers <ps snapshot> <pid> [except]: the children of pid, except one,
 # whose command line does not contain "mcp" (the default helper allow-list).
+# Only children, as in the policy: a process under a helper is part of it.
 not_helpers() {
   awk -v p="$2" -v except="${3:-}" '$2 == p && $1 != except && index($0, "mcp") == 0' "$1"
 }
@@ -266,8 +271,13 @@ check "herdr-shell started \$SHELL in a terminal without the label" [ "$(field "
 hc send "$fish_agent" "$bin/claude --model haiku" >/dev/null || die "typing the fake claude into fish"
 wait_until 15 "the fish-hosted agent to report idle" 'reports "$fish_agent" claude idle'
 
+# record <agent> <root>: the suspension record for the terminal JSON on stdin.
+record() {
+  json 'JSON.stringify({ version: 1, agent: a[0], root: a[1], cwd: t.foreground.cwd, since: Date.now() })' "$1" "$2"
+}
+
 # suspend <terminal> <agent> <expected root>: the policy's steps, in order.
-# Sets standin_pid and helpers (the processes under a root=agent agent).
+# Sets standin_pid and under_agent (every process under a root=agent agent).
 suspend() {
   t=$1; agent=$2; expected_root=$3
   # 1. Read the terminal again: a live, idle, resumable agent, with only
@@ -282,9 +292,9 @@ suspend() {
   [ -z "$(not_helpers "$work/ps-$t" "$agent_pid")" ] || die "$t: the agent runs processes that are not helpers"
   if [ "$found_root" = shell ]; then
     [ -z "$(not_helpers "$work/ps-$t" "$pid" "$agent_pid")" ] || die "$t: the hosting shell runs other jobs"
-    helpers=
+    under_agent=
   else
-    helpers=$(descendants "$work/ps-$t" "$pid")
+    under_agent=$(descendants "$work/ps-$t" "$pid")
   fi
   # 2. Keep the terminal, so the signal leaves it live.
   hc keep "$t" >/dev/null || die "hc keep $t"
@@ -293,15 +303,14 @@ suspend() {
   watched='`${t.status?.state}:${t.turn}:${t.pid}:${t.foreground?.pid}`'
   [ "$(printf '%s' "$before" | json "$watched")" = "$(printf '%s' "$after" | json "$watched")" ] || die "$t changed during the steps"
   # 4. The suspension record.
-  record=$(printf '%s' "$before" | json 'JSON.stringify({ version: 1, agent: a[0], root: a[1], cwd: t.foreground.cwd, since: Date.now() })' "$agent" "$found_root")
-  hc label "$t" "herdr.suspended=$record" >/dev/null || die "hc label $t"
+  hc label "$t" "herdr.suspended=$(printf '%s' "$before" | record "$agent" "$found_root")" >/dev/null || die "hc label $t"
   # 5. End the main program. hc starts herdr-shell, which starts the stand-in.
   #    root=agent: SIGKILL, which no agent can turn into an exit code, then
   #    SIGTERM to the processes under it. root=shell: SIGTERM to the shell.
   if [ "$found_root" = agent ]; then
     kill -KILL "$pid"
     # shellcheck disable=SC2086
-    [ -z "$helpers" ] || kill -TERM $helpers 2>/dev/null || :
+    [ -z "$under_agent" ] || kill -TERM $under_agent 2>/dev/null || :
   else
     kill -TERM "$pid"
   fi
@@ -326,12 +335,12 @@ suspend() {
   [ "$(uname -s)" != Darwin ] || expected_main="$expected_main -l"
   check "$t: the stand-in is the main program ($main)" [ "$main" = "$expected_main" ]
   check "$t: the agent process ended" sh -c "[ -n '$agent_pid' ] && ! kill -0 '$agent_pid' 2>/dev/null"
-  if [ -n "$helpers" ]; then
+  if [ -n "$under_agent" ]; then
     n=0
     # shellcheck disable=SC2086
-    while alive $helpers && [ "$n" -lt 50 ]; do n=$((n + 1)); sleep 0.1; done
+    while alive $under_agent && [ "$n" -lt 50 ]; do n=$((n + 1)); sleep 0.1; done
     # shellcheck disable=SC2086
-    check "$t: the processes under the agent ended ($(echo $helpers))" sh -c "! { $(printf 'kill -0 %s 2>/dev/null || ' $helpers) false; }"
+    check "$t: the processes under the agent ended ($(echo $under_agent))" eval '! alive $under_agent'
   fi
   kb=$(footprint_kb "$standin_pid")
   check "$t: the stand-in's footprint is 10 MB or less (${kb:-unknown} KB)" sh -c "[ -n '$kb' ] && [ '$kb' -le 10240 ]"
@@ -403,7 +412,7 @@ echo "--- real pi, root=agent: SIGKILL"
 pi_kill=$(real_pi hsi-pi-kill)
 identity_before=$(identity "$pi_kill")
 suspend "$pi_kill" pi agent
-check "$pi_kill: SIGKILL found helper processes under the real Pi" [ -n "$helpers" ]
+check "$pi_kill: the snapshot found the helper processes under the real Pi" [ -n "$under_agent" ]
 check "$pi_kill: address, name, labels and parent unchanged while suspended" [ "$(identity "$pi_kill" herdr.suspended)" = "$identity_before" ]
 sleep 2
 check "$pi_kill: the stand-in still holds the live terminal 2 s later" \
@@ -414,8 +423,7 @@ pi_term=$(real_pi hsi-pi-term)
 term_pid=$(field "$pi_term" t.pid)
 check "$pi_term: the real Pi is the main program (root=agent)" [ "$(field "$pi_term" 't.pid === t.foreground?.pid')" = true ]
 hc keep "$pi_term" >/dev/null || die "hc keep $pi_term"
-term_record=$(get "$pi_term" | json 'JSON.stringify({ version: 1, agent: "pi", root: "agent", cwd: t.foreground.cwd, since: Date.now() })')
-hc label "$pi_term" "herdr.suspended=$term_record" >/dev/null || die "hc label $pi_term"
+hc label "$pi_term" "herdr.suspended=$(get "$pi_term" | record pi agent)" >/dev/null || die "hc label $pi_term"
 kill -TERM "$term_pid"
 wait_until 15 "$pi_term to end or start a new program" \
   '[ "$(field "$pi_term" "t.state")" != live ] || { p=$(field "$pi_term" "t.pid"); [ -n "$p" ] && [ "$p" != "$term_pid" ]; }'
@@ -423,13 +431,10 @@ term_end=$(field "$pi_term" '`${t.state}, exit_code ${t.exit_code}, signal ${t.s
 check "$pi_term: SIGTERM to a real Pi as root=agent ends the kept terminal ($term_end)" \
   [ "$term_end" = "finished, exit_code 0, signal null" ]
 
-# The wake watchdog runs 30 s after each wake. The woken agents reported, so
-# it must leave their reports alone.
-left=$((last_wake + 32 - $(date +%s)))
-if [ "$left" -gt 0 ]; then echo "--- waiting ${left}s for the wake watchdogs"; sleep "$left"; fi
+# The woken agents reported, so the wake watchdogs must leave their reports alone.
+wait_watchdogs
 check "$run_agent: the wake watchdog left the woken agent's report alone" reports "$run_agent" pi idle
 check "$fish_agent: the wake watchdog left the woken agent's report alone" reports "$fish_agent" claude idle
-last_wake=
 check "no received text ran as a shell command, in any case" sh -c "! ls '$work'/ran-* >/dev/null 2>&1"
 
 echo "---"
