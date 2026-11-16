@@ -96,6 +96,15 @@ test("Claude recovery types its launch options before --resume", async () => {
   assert.deepEqual(sent(), [["send", "t42", "claude '--model' 'haiku' '--permission-mode' 'plan' --resume 'claude-id'"], ["send", "t43", "claude --resume 'claude-id'"]]);
 });
 
+test("Claude recovery types nothing into a terminal it cannot read or a stand-in holds", async () => {
+  for (const state of [null, { state: "live", pid: 1, foreground: { pid: 1 }, labels: { "herdr.suspended": "{}" } }]) {
+    reset();
+    current = state;
+    await recover(cx, "t42", "claude", { "herdr.claude-session": "claude-id" }, null);
+    assert.deepEqual(sent(), []);
+  }
+});
+
 test("missing file or metadata opens the picker without timeout or /exit", async () => {
   reset();
   fileCode = 1;

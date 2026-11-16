@@ -522,7 +522,9 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
   }
 
   // The ordered suspension steps. Any failed check aborts, and nothing more
-  // is changed (an earlier keep stays: it is harmless).
+  // is changed (an earlier keep stays: it is harmless). One exception: when
+  // the signal fails, the agent still runs, so the label comes off again;
+  // otherwise the sidebar would show a live agent as suspended.
   /**
    * @param {string} address
    * @param {{ now?: number, manual?: boolean }} [options]
@@ -559,7 +561,10 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
     if (!await succeeds(hc(["label", address, `${SUSPENDED}=${JSON.stringify(label)}`]))) return abort("failed");
     if (closed) return abort("closed");
     // 5. End the main program: hc starts herdr-shell, which starts the stand-in.
-    if (!await succeeds(exec("kill", [`-${SIGNAL}`, String(pid)]))) return abort("failed");
+    if (!await succeeds(exec("kill", [`-${SIGNAL}`, String(pid)]))) {
+      await hc(["label", address, `${SUSPENDED}=`]).catch(() => /** @type {null} */ (null));
+      return abort("failed");
+    }
     return { suspended: true };
   }
 

@@ -6,7 +6,7 @@
 import { hc, exec } from "herdr";
 import { isClaude, processIdentity, claudeLaunchWords } from "./claude-polling.js";
 
-import { LABEL, SESSION, CLAUDE_OPTIONS, PI_RECOVERY, piRecovery, holdsPiSession, recoveryLine, claudeOptionsLabel } from "./recipes.js";
+import { LABEL, SESSION, CLAUDE_OPTIONS, PI_RECOVERY, SUSPENDED, piRecovery, holdsPiSession, recoveryLine, claudeOptionsLabel } from "./recipes.js";
 export { LABEL, SESSION, RECIPES } from "./recipes.js";
 
 // Types a command line into the terminal's shell, so the person's own agent
@@ -33,6 +33,17 @@ async function info(address) {
 // The shell is in front again, or the terminal is gone.
 const atShell = (j) => !j || j.state !== "live" || !j.foreground || j.foreground.pid === j.pid;
 
+// The app name the stand-in reports (suspend/standin.ts; suspend-policy.js
+// exports it as STANDIN_APP).
+const STANDIN_APP = "herdr-standin";
+
+// A stand-in holds the terminal (GLOSSARY.md): it carries the suspension
+// label, or its own report is still there because it is waking the agent
+// (it removes the label just before it replaces itself, and its "working"
+// report stays until the woken agent reports). A stand-in is the terminal's
+// main program, so atShell() passes for it: recovery must never type into it.
+const standin = (j) => Object.hasOwn(j?.labels ?? {}, SUSPENDED) || j?.status?.app === STANDIN_APP;
+
 async function until(cx, address, ms, done, check) {
   for (let t = 0; t < ms; t += 500) {
     check();
@@ -57,7 +68,7 @@ async function attempt(cx, address, line, check) {
     await hc(["send", address, "/exit"]).catch(() => null);
     const out = await until(cx, address, EXIT_MS, atShell, check);
     check();
-    if (!atShell(out)) return; // it didn't quit: leave it as it is
+    if (!atShell(out) || standin(out)) return; // it didn't quit: leave it as it is
   }
 }
 
@@ -79,7 +90,14 @@ export function createRecovery() {
     // Already-issued commands cannot be recalled; forbid every follow-up.
     close() { closed = true; queue = Promise.resolve(); },
     recover(cx, address, agent, labels, tab) {
-      if (agent !== "pi") return enqueue(() => attempt(cx, address, recoveryLine(agent, labels, { tab }), check));
+      // Read the terminal just before typing: a ↻ shown before a suspension
+      // (a stale click) must not type into the stand-in.
+      if (agent !== "pi") return enqueue(async () => {
+        const current = await info(address);
+        check();
+        if (!current || standin(current)) return;
+        await attempt(cx, address, recoveryLine(agent, labels, { tab }), check);
+      });
       // Pi must not use Claude's report timeout and /exit retry: its session
       // picker can wait indefinitely. Send once, only while still at a shell.
       return enqueue(async () => {
@@ -94,7 +112,7 @@ export function createRecovery() {
         }
         const current = await info(address);
         check();
-        if (!current || current.state !== "live" || !atShell(current)) return;
+        if (!current || current.state !== "live" || !atShell(current) || standin(current)) return;
         await send(address, recoveryLine("pi", labels, { picker }));
       });
     },

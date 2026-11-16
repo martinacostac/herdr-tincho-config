@@ -211,11 +211,13 @@ test("step 4 aborts when the label cannot be set: no signal", async () => {
   assert.deepEqual(actions().map((c) => c[1]), ["get", "keep", "get", "label"]);
 });
 
-test("step 5 reports a signal that could not be sent", async () => {
+test("step 5 reports a signal that could not be sent, and removes the label from the agent that still runs", async () => {
   reset();
   failing.add("kill");
   assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: false, reason: "failed" });
-  assert.deepEqual(actions().map((c) => c[0] === "kill" ? "kill" : c[1]), ["get", "keep", "get", "label", "kill"]);
+  assert.deepEqual(actions().map((c) => c[0] === "kill" ? "kill" : c[1]), ["get", "keep", "get", "label", "kill", "label"]);
+  // Without the label, the sidebar shows the live agent, not a suspended one.
+  assert.deepEqual(actions().at(-1), ["hc", "label", "t7", `${SUSPENDED}=`]);
 });
 
 test("a closed copy stops between steps", async () => {
@@ -561,6 +563,18 @@ test("a manual request skips the threshold, and its result is shared with the re
   await render(a, "one", NOW + 500);
   await render(a, "one", NOW + 750);
   assert.deepEqual(actions(), []);
+});
+
+test("a manual request whose signal fails is shared as failed, with the label removed again", async () => {
+  resetCopies();
+  failing.add("kill");
+  const a = copy("a");
+  await render(a, "one", NOW);
+  calls = [];
+  request("t7", NOW + 100);
+  await render(a, "one", NOW + 250);
+  assert.deepEqual(state().results.t7, { requested: NOW + 100, suspended: false, reason: "failed", at: NOW + 250 });
+  assert.deepEqual(actions().filter((c) => c[1] === "label").map((c) => c.at(-1).split("=")[1] === ""), [false, true]);
 });
 
 test("a manual request still applies every other rule, and the requester gets the reason", async () => {

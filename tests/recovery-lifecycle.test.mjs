@@ -130,7 +130,7 @@ test("closing a sidebar asleep with active and queued recovery does not stall it
   await Promise.all(old.owner.tasks);
 });
 
-const boundaries = ["Pi file exec", "Pi shell get", "Pi send", "Claude send", "Claude report get", "Claude final report get", "Claude /exit", "Claude exit get"];
+const boundaries = ["Pi file exec", "Pi shell get", "Pi send", "Claude stand-in check get", "Claude send", "Claude report get", "Claude final report get", "Claude /exit", "Claude exit get"];
 for (const boundary of boundaries) {
   test(`close during ${boundary}: new copy starts; late completion cannot follow up`, async () => {
     reset();
@@ -147,9 +147,11 @@ for (const boundary of boundaries) {
         "Pi file exec": kind === "exec",
         "Pi shell get": verb === "get",
         "Pi send": verb === "send",
+        // Claude's first get checks for a stand-in, before anything is typed.
+        "Claude stand-in check get": verb === "get" && gets === 1,
         "Claude send": verb === "send",
-        "Claude report get": verb === "get",
-        "Claude final report get": verb === "get" && gets === 41,
+        "Claude report get": verb === "get" && gets === 2,
+        "Claude final report get": verb === "get" && gets === 42,
         "Claude /exit": line === "/exit",
         "Claude exit get": verb === "get" && exiting,
       }[boundary];
@@ -194,7 +196,7 @@ test("rejected recovery releases the owner's queue and exact Pi recovery stays o
   reset();
   const failed = deferred();
   const normal = respond;
-  respond = (call) => call.kind === "hc" && call.args[0][1] === "failed" ? failed.promise : normal(call);
+  respond = (call) => call.kind === "hc" && call.args[0][0] === "send" && call.args[0][1] === "failed" ? failed.promise : normal(call);
   const copy = sidebar("owner");
   copy.click("failed", "claude");
   copy.click("pi", "pi", labels);
@@ -250,4 +252,35 @@ test("closing one simultaneous sidebar does not cancel another owner's queue", a
   await flush();
   assert.deepEqual(sends(second.owner), [["send", "second", "pi --session '/fake/session.jsonl' '--thinking' 'high'"]]);
   assert.deepEqual(sends(first.owner), []);
+});
+
+// A stand-in is the terminal's main program, so the "at a shell" check
+// (foreground.pid === pid) passes for it. Recovery reads the terminal just
+// before it types and refuses one: a ↻ shown before the agent was suspended
+// (a stale click) types nothing.
+const standin = { ...shell, labels: { "herdr.suspended": JSON.stringify({ version: 1, agent: "pi", root: "agent", cwd: "/fake/project", since: 1 }) }, status: { app: "herdr-standin", state: "idle" } };
+for (const agent of ["pi", "claude"]) {
+  test(`a stale ↻ click types nothing into a suspended ${agent} agent's stand-in`, async () => {
+    reset();
+    respond = ({ kind, args }) => kind === "exec" ? ok({ type: "session", id: record.sessionId }) : args[0][0] === "get" ? ok(standin) : ok();
+    const copy = sidebar("owner", { immediateSleep: true });
+    copy.click("t7", agent, agent === "pi" ? labels : { "herdr.claude-session": "saved-session" });
+    for (let i = 0; i < 5; i++) await flush();
+    await Promise.all(copy.owner.tasks);
+    assert.deepEqual(sends(), []);
+  });
+}
+
+test("recovery types nothing while a stand-in wakes its agent, label already removed", async () => {
+  reset();
+  // The stand-in removed its label and replaced itself with the agent, which
+  // has not reported yet: the stand-in's "working" report is still there.
+  const waking = { ...shell, labels: {}, status: { app: "herdr-standin", state: "working" } };
+  respond = ({ kind, args }) => kind === "exec" ? ok({ type: "session", id: record.sessionId }) : args[0][0] === "get" ? ok(waking) : ok();
+  const copy = sidebar("owner", { immediateSleep: true });
+  copy.click("t7", "pi", labels);
+  copy.click("t8", "claude");
+  for (let i = 0; i < 5; i++) await flush();
+  await Promise.all(copy.owner.tasks);
+  assert.deepEqual(sends(), []);
 });
