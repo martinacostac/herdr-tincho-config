@@ -29,7 +29,7 @@ export function system(): System {
       }
     },
     async background(argv) {
-      await Bun.spawn(argv, { stdin: "ignore", stdout: "inherit", stderr: "ignore" }).exited;
+      await Bun.spawn(argv, { stdin: "ignore", stdout: "inherit", stderr: "ignore", detached: true }).exited;
     },
     async list(dir) {
       try { return readdirSync(dir); } catch { return []; }
@@ -49,12 +49,12 @@ export function system(): System {
     after: (ms, run) => { setTimeout(run, ms); },
     onError(handler) {
       let alive: ReturnType<typeof setInterval> | null = null;
-      const keep = (error: unknown) => {
+      const stayAlive = (error: unknown) => {
         alive ??= setInterval(() => {}, 2 ** 30); // nothing else may be left to keep the process alive
         try { handler(error); } catch { /* the handler failed too: stay alive anyway */ }
       };
-      process.on("uncaughtException", keep);
-      process.on("unhandledRejection", keep);
+      process.on("uncaughtException", stayAlive);
+      process.on("unhandledRejection", stayAlive);
     },
   };
 }

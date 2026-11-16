@@ -10,6 +10,9 @@ const PASTE_END = "\x1b[201~";
 
 export type InputEvent = { message: string } | { enter: true };
 
+/** Text without the line breaks at its start and end. */
+export const trimLineBreaks = (text: string) => text.replace(/^\n+|\n+$/g, "");
+
 // The length of the escape sequence at s[i], or 0 when it continues in the next read.
 function escapeLength(s: string, i: number): number {
   const kind = s[i + 1];
@@ -79,7 +82,7 @@ export function createInput(emit: (event: InputEvent) => void, echo: (text: stri
         // (there Enter became LF), or Ctrl-J: the message goes on, unless
         // nothing follows it in this read. In raw mode Enter is CR.
         if (c === "\n" && i < s.length) { line += "\n"; echo("\r\n"); continue; }
-        const text = line.replace(/^\n+|\n+$/g, "");
+        const text = trimLineBreaks(line);
         if (text.trim()) { echo("\r\n"); emit({ message: text }); }
         else emit({ enter: true });
         line = "";

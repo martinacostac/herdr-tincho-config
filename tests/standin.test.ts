@@ -18,7 +18,17 @@ const PROJECTS = "/home/me/.claude/projects";
 // Claude's transcripts: <id>.jsonl in a folder per project.
 const TRANSCRIPTS: Record<string, string[]> = { "-other": ["x.jsonl"], "-project": ["claude-id.jsonl", "abc.jsonl"] };
 
-type Options = { labels?: Record<string, string> | null; files?: Record<string, string>; env?: Record<string, string | undefined>; exec?: (argv: string[]) => string | null | Promise<string>; hc?: (args: string[]) => { code: number; stdout: string } | undefined; saveFails?: boolean; backgroundFails?: boolean; transcripts?: Record<string, string[]>; platform?: string };
+type Options = {
+  labels?: Record<string, string> | null;
+  files?: Record<string, string>;
+  env?: Record<string, string | undefined>;
+  exec?: (argv: string[]) => string | null | Promise<string>;
+  hc?: (args: string[]) => { code: number; stdout: string } | undefined;
+  saveFails?: boolean;
+  backgroundFails?: boolean;
+  transcripts?: Record<string, string[]>;
+  platform?: string;
+};
 
 function fake(options: Options = {}) {
   const writes: string[] = [];
@@ -469,10 +479,11 @@ describe("failed wakes and errors", () => {
 describe("watchdog", () => {
   // The watchdog the stand-in started, run for real with a fake hc on PATH
   // and no wait. It returns what it wrote to the terminal and the hc calls.
-  async function watchdog(argv: string[], answer: { code: number; json?: unknown }) {
+  async function watchdog(argv: string[], answer: { code: number; json?: unknown; spaced?: boolean }) {
     const dir = mkdtempSync(join(tmpdir(), "standin-watchdog-"));
     try {
-      writeFileSync(join(dir, "answer"), answer.json === undefined ? "" : JSON.stringify(answer.json));
+      const json = answer.json === undefined ? "" : JSON.stringify(answer.json);
+      writeFileSync(join(dir, "answer"), answer.spaced ? json.replaceAll('":', '": ').replaceAll(',"', ', "') : json); // Python's json.dumps style
       writeFileSync(join(dir, "hc"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${dir}/calls"\ncat "${dir}/answer"\nexit ${answer.code}\n`, { mode: 0o755 });
       const run = Bun.spawn([...argv.slice(0, -1), "0"], { env: { PATH: `${dir}:/usr/bin:/bin` }, stdout: "pipe", stderr: "pipe" });
       const written = await new Response(run.stdout).text(); // the end comes when the background part ends
@@ -525,6 +536,17 @@ describe("watchdog", () => {
     expect(result.written).toBe(IDLE);
   });
 
+  test("reads hc's JSON with spaces too", async () => {
+    const result = await watchdog(await started(), { code: 0, json: terminal(STANDIN_REPORT, AGENT_FRONT), spaced: true });
+    expect(result.written).toBe(IDLE);
+  });
+
+  test("a label named status_ms does not hide the report time", async () => {
+    const json = { ...terminal(STANDIN_REPORT, AGENT_FRONT), labels: { status_ms: "9999999999999" } };
+    const result = await watchdog(await started(), { code: 0, json });
+    expect(result.written).toBe(IDLE);
+  });
+
   for (const [name, answer] of [
     ["the stand-in is in front (its path)", { code: 0, json: terminal(STANDIN_REPORT, { argv: ["/bin dir/herdr-standin", "pi", "t7", "worker"], cwd: "/", name: "herdr-standin", pid: 11 }) }],
     ["the stand-in is in front (its name only)", { code: 0, json: terminal(STANDIN_REPORT, { argv: ["x"], cwd: "/", name: "herdr-standin", pid: 11 }) }],
@@ -534,6 +556,8 @@ describe("watchdog", () => {
     ["a later wake reported after it started", { code: 0, json: terminal(STANDIN_REPORT, AGENT_FRONT, Date.now() + 120_000) }],
     ["hc gives no report time", { code: 0, json: { ...terminal(STANDIN_REPORT, AGENT_FRONT), status_ms: null } }],
     ["hc fails", { code: 3, json: { error: { kind: "not_found" } } }],
+    ["the terminal is finished", { code: 0, json: { ...terminal(STANDIN_REPORT, null), state: "finished" } }],
+    ["the woken agent reported and a label is named app", { code: 0, json: { ...terminal({ app: "pi", state: "idle" }, AGENT_FRONT), labels: { app: "herdr-standin" } } }],
   ] as [string, { code: number; json: unknown }][]) {
     test(`writes nothing when ${name}`, async () => {
       const result = await watchdog(await started(), answer);
@@ -576,14 +600,16 @@ describe("missing session", () => {
     });
   }
 
-  test("repeated empty wakes (focus presses) report blocked once", async () => {
+  test("repeated empty wakes (Enter presses) report blocked each time, and show their reason once", async () => {
     const t = fake({ labels: { "herdr.suspended": suspended("agent", "claude") } });
     await t.start(["claude", "t3", "worker"]);
     for (let i = 0; i < 3; i++) { await t.input("\r"); await t.tick(500); }
-    expect(reports(t.screen())).toEqual(["idle", "blocked"]);
+    expect(reports(t.screen())).toEqual(["idle", "blocked", "blocked", "blocked"]);
+    expect(t.screen().split("not woken").length - 1).toBe(1);
     await t.input(paste("a message"));
     await t.tick(500);
-    expect(reports(t.screen())).toEqual(["idle", "blocked", "blocked"]);
+    expect(reports(t.screen())).toEqual(["idle", "blocked", "blocked", "blocked", "blocked"]);
+    expect(t.screen().split("not woken").length - 1).toBe(2);
   });
 
   test("when the file cannot be written, the messages are shown but kept out of the status", async () => {

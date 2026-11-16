@@ -7,7 +7,8 @@
 // module that recovery uses; this file builds it into the binary.
 
 import { PI_RECOVERY, SESSION, STANDIN_APP, SUSPENDED, holdsPiSession, shellQuote, piRecovery, recipe, suspension, type Suspension } from "../herdr/mods/tab-tree/recipes.js";
-import { createInput, type InputEvent } from "./input";
+import { createInput, trimLineBreaks, type InputEvent } from "./input";
+import { watchdog } from "./watchdog";
 
 export interface System {
   env: Record<string, string | undefined>;
@@ -30,7 +31,7 @@ export interface System {
   save(path: string, text: string): Promise<void>;
   /** Changes the working folder; an error text on failure. */
   chdir(path: string): string | null;
-  /** Runs argv with the terminal as its output and waits until it exits. */
+  /** Runs argv detached (its own session), with the terminal as its output, and waits until it exits. */
   background(argv: string[]): Promise<void>;
   /** Replaces this process (execvp). Never settles on success; the error text on failure. */
   exec(argv: string[]): Promise<string>;
@@ -50,32 +51,9 @@ const RETRIES = 10; // about 2 s while the core restarts
 // exiting the agent returns to a prompt.
 const thenShell = (shellWords: string[]) => `"$@"; exec "\${SHELL:-/bin/sh}"${shellWords.map((w) => ` ${shellQuote(w)}`).join("")}`;
 
-// After execvp, hc keeps the stand-in's "working" report until the woken agent
-// reports (fact F5 in plans/agent-suspension.md), and Claude can miss its
-// status handshake and never report: hc would show the agent working, as the
-// stand-in, for good. So before it replaces itself the stand-in leaves this
-// watchdog, plain sh in the background (the outer sh exits at once, so it is
-// no child of the agent). After $2 seconds it reads terminal $1 once. When the
-// report is still the stand-in's, at least $2 seconds old, and the stand-in is
-// not in front, it writes one idle report with no app. Otherwise it writes
-// nothing. In hc's JSON a quote inside a string is escaped, so these patterns
-// cannot match inside labels or words.
-export const WATCH_SECONDS = 30;
-const WATCHDOG = `(
-sleep "$2"
-out=$(hc get "$1" --json 2>/dev/null) || exit 0
-case $out in *'"app":"${APP}"'*) ;; *) exit 0 ;; esac
-case $out in *'"name":"${APP}"'* | *'/${APP}"'* | *'["${APP}"'*) exit 0 ;; esac
-ms=\${out#*'"status_ms":'}
-[ "$ms" != "$out" ] || exit 0
-ms=\${ms%%[!0-9]*}
-[ -n "$ms" ] || exit 0
-[ $(( $(date +%s) - ms / 1000 )) -ge "$2" ] || exit 0
-printf '\\033]7501;state=idle\\033\\\\'
-) </dev/null 2>/dev/null &`;
-
+type Status = "idle" | "working" | "blocked";
 // An OSC 7501 status report (fact F5 in plans/agent-suspension.md).
-const report = (state: "idle" | "working" | "blocked", msg?: string) =>
+const report = (state: Status, msg?: string) =>
   `\x1b]7501;state=${state}:app=${APP}${msg ? `:msg=${Buffer.from(msg).toString("base64")}` : ""}\x1b\\`;
 const pad = (n: number) => String(n).padStart(2, "0");
 const clock = (ms: number) => { const d = new Date(ms); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
@@ -91,15 +69,15 @@ export async function standin(args: string[], sys: System): Promise<void> {
   const shellWords = shellArgs.length ? shellArgs : sys.platform === "darwin" ? ["-l"] : [];
   const pause = (ms: number) => new Promise<void>((done) => sys.after(ms, done));
   // Never passed on to the agent or a shell.
-  const pending = sys.env[PENDING]?.replace(/^\n+|\n+$/g, "") ?? "";
+  const pending = trimLineBreaks(sys.env[PENDING] ?? "");
   if (PENDING in sys.env) sys.unsetenv(PENDING);
   let agent = agentArg;
   let batch: string[] | null = null; // the messages of the wake being collected
-  let batchId = 0; // ends the window of a batch that an error already handled
+  let batchGeneration = 0; // ends the window of a batch that an error already handled
   let windowClosed = false; // the 500 ms after the first message are over
   let waking = false;
-  let state: "idle" | "working" | "blocked" | null = null; // the last report
-  const say = (next: "idle" | "working" | "blocked", msg?: string) => { sys.write(report(next, msg)); state = next; };
+  let reported: Status | null = null; // the last report
+  const reportStatus = (state: Status, msg?: string) => { sys.write(report(state, msg)); reported = state; };
 
   // An unexpected error takes the missing-session path: the collected messages
   // go to a file and the stand-in reports blocked. It never exits.
@@ -178,7 +156,7 @@ export async function standin(args: string[], sys: System): Promise<void> {
     const { record, labels } = suspended;
     const start = recipe(record.agent, labels, { tab: name || null, picker: false });
     if (!start) return `${agent} has no recipe`;
-    say("working");
+    reportStatus("working");
     sys.write(`waking ${agent}…\r\n`);
     const cwd = start.cwd ?? record.cwd;
     const chdirError = sys.chdir(cwd);
@@ -187,7 +165,7 @@ export async function standin(args: string[], sys: System): Promise<void> {
     const messages = batch ?? [];
     const words = messages.length ? [...start.argv, "--", messages.join("\n\n")] : start.argv;
     const argv = record.root === "shell" ? ["/bin/sh", "-c", thenShell(shellWords), "sh", ...words] : words;
-    await sys.background(["/bin/sh", "-c", WATCHDOG, "sh", address, String(WATCH_SECONDS)]).catch(() => {});
+    await sys.background(watchdog(address)).catch(() => {});
     sys.write("\x1b[?2004l");
     sys.raw(false);
     const error = await sys.exec(argv).catch(describe);
@@ -204,8 +182,8 @@ export async function standin(args: string[], sys: System): Promise<void> {
   }
 
   // Not woken: keep the messages in a file, say where, and report blocked so
-  // hc tells the parent. An empty wake (a focus press) that never reported
-  // working says it only once.
+  // hc tells the parent. Every failed wake reports blocked again; an empty
+  // one (a focus press) shows its reason on the screen only once.
   async function keepUndelivered(messages: string[], reason: string) {
     let note = `${agent} not woken: ${reason}.`;
     let shown = note;
@@ -219,15 +197,15 @@ export async function standin(args: string[], sys: System): Promise<void> {
         note += ` Could not save the messages: ${(error as Error).message}`;
         shown = `${note}\n${text}`;
       }
-    } else if (state === "blocked") return;
-    sys.write(`\r\n💤 ${shown.replace(/\n/g, "\r\n")}\r\n`);
-    say("blocked", note);
+    }
+    if (messages.length || reported !== "blocked") sys.write(`\r\n💤 ${shown.replace(/\n/g, "\r\n")}\r\n`);
+    reportStatus("blocked", note);
   }
 
   function takeBatch() {
     const messages = batch ?? [];
     batch = null;
-    batchId++;
+    batchGeneration++;
     windowClosed = false;
     return messages;
   }
@@ -249,8 +227,8 @@ export async function standin(args: string[], sys: System): Promise<void> {
   function onEvent(event: InputEvent) {
     if (batch === null) {
       batch = [];
-      const id = batchId;
-      sys.after(BATCH_MS, () => { if (id === batchId) { windowClosed = true; maybeWake(); } });
+      const generation = batchGeneration;
+      sys.after(BATCH_MS, () => { if (generation === batchGeneration) { windowClosed = true; maybeWake(); } });
     }
     if ("message" in event) batch.push(event.message);
   }
@@ -263,9 +241,9 @@ export async function standin(args: string[], sys: System): Promise<void> {
   if ("cannotWake" in suspended) {
     // Blocked, so hc refuses sends and tells the parent; typed messages are kept in files.
     sys.write(`💤 ${agent} cannot wake: ${suspended.cannotWake}. Typed messages are kept in files.\r\n`);
-    say("blocked", `${agent} cannot wake: ${suspended.cannotWake}`);
+    reportStatus("blocked", `${agent} cannot wake: ${suspended.cannotWake}`);
   } else {
-    say("idle");
+    reportStatus("idle");
   }
   if (pending.trim()) onEvent({ message: pending });
 }
