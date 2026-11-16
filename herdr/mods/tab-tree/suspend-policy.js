@@ -6,8 +6,9 @@
 // whose tab stays focused.
 
 import { settings, focused, panes, terminals, shared, setShared, readTextFile, exec, hc } from "herdr";
-import { SESSION, PI_RECOVERY, SUSPENDED, piRecovery, suspension } from "./recipes.js";
+import { SESSION, PI_RECOVERY, SUSPENDED, STANDIN_APP, piRecovery, suspension } from "./recipes.js";
 import { isClaude } from "./claude-polling.js";
+import { frontProgram, standinInFront, HERDR_SHELL } from "./resume.js";
 
 export const NEVER_SUSPEND = "herdr.never-suspend";
 
@@ -215,7 +216,28 @@ async function suspensionInstalled() {
   return configuredShell(text) === `${bin}/herdr-shell`;
 }
 
-/** @typedef {Reason | "not-installed" | "gone" | "changed" | "failed" | "closed"} Outcome */
+/** @typedef {Reason | "not-installed" | "gone" | "changed" | "failed" | "closed" | "repaired"} Outcome */
+
+// A suspension label younger than this is never repaired: the steps between
+// the label (4) and the stand-in's start take far less.
+const REPAIR_MS = 60_000;
+
+// Whether a terminal carries a suspension label that no stand-in holds: it is
+// live and local, and hc shows a program in front that is neither the
+// stand-in nor herdr-shell (which starts the stand-in, or waits when it
+// cannot), and the label is REPAIR_MS old or more (or has no readable time).
+// That happens when the mod closed between steps 4 and 5, or when someone set
+// the label by hand.
+/** @param {Record<string, any> | null | undefined} t @param {number} now */
+function staleLabel(t, now) {
+  if (typeof t?.address !== "string" || remote(t.address) || t.state !== "live") return false;
+  const labels = t.labels ?? {};
+  if (!Object.hasOwn(labels, SUSPENDED)) return false;
+  const front = frontProgram(t);
+  if (!front || standinInFront(t) || front.name === HERDR_SHELL) return false;
+  const since = suspension(labels[SUSPENDED])?.since;
+  return !(Number.isFinite(since) && now - since < REPAIR_MS);
+}
 
 // Shared state (setShared/shared) between the copies of the mod, one per
 // window that shows tab-tree.
@@ -238,8 +260,7 @@ const SEEN_MS = 24 * 60 * MINUTE;
 // A suspended agent wakes when its tab stays focused this long. Stepping past
 // tabs (⌘P, the next-agent command) moves on sooner and wakes nothing.
 const WAKE_FOCUS_MS = 1_000;
-// The app name the stand-in reports (suspend/standin.ts).
-export const STANDIN_APP = "herdr-standin";
+export { STANDIN_APP };
 
 // A stand-in that waits for a message: the suspension label, and an idle
 // report from the stand-in itself (not "working" while it wakes the agent,
@@ -262,20 +283,28 @@ const idleStandin = (t) => Object.hasOwn(t?.labels ?? {}, SUSPENDED) &&
 //
 // SUSPEND_STATE, written by the leader only:
 //   { agents: { [address]: { auto: Outcome | null, manual: Outcome | null } },
-//     results: { [address]: { requested: ms, suspended: boolean, reason: Outcome | null, at: ms } } }
+//     results: { [address]: { requested: ms | null, suspended: boolean, reason: Outcome | null, at: ms,
+//                             source: "manual" | "auto" | "repair", step?: "keep" | "label" | "signal", rolledBack?: boolean } } }
 //   agents: each local agent's current reason, from the last pass (every
 //   15 s): auto for automatic suspension, manual for "Suspend now". null
 //   means no rule fails, except maybe the process rule: to keep the pass
 //   cheap, the process table is read only for an agent about to be
 //   suspended, so "background" and "processes-unknown" show up only after an
-//   attempt (and in results). results: the outcome of the latest request for
-//   each terminal (requested is the request's value), kept for RESULT_MS.
+//   attempt (and in results). results: the latest outcome for each terminal,
+//   kept for RESULT_MS: of a manual request (source "manual"; requested is
+//   the request's value), of an automatic suspension that failed ("auto"),
+//   or of a label repair ("repair"). An automatic or repair result keeps the
+//   requested value of the result it replaces (null without one), so a
+//   request is still answered once. A failure says its step (keep, label or
+//   signal); for the signal, rolledBack says whether the label came off
+//   again (the agent still ran).
 // A reason is an Outcome: a rule from unusedAgent(), or "not-installed" (the
 // stand-in or herdr-shell is missing, or herdr-shell is not hc's shell; in
 // agents only after a pass had an agent past its threshold),
 // "gone" (the terminal ended), "changed" (its status, turn or program changed
-// during the steps), "failed" (an hc command or the signal failed), or
-// "closed" (the mod closed).
+// during the steps), "failed" (an hc command or the signal failed),
+// "closed" (the mod closed), or "repaired" (the leader removed a label that
+// no stand-in held, see staleLabel()).
 export const SUSPEND_REQUESTS = "tincho.suspend.requests";
 export const SUSPEND_STATE = "tincho.suspend.state";
 const REQUEST_MS = 60_000;
@@ -284,7 +313,8 @@ const RESULT_MS = 10 * 60_000;
 // the process table for it again only after this long.
 const PROCESS_RETRY_MS = 5 * 60_000;
 
-/** @typedef {{ requested: number, suspended: boolean, reason: Outcome | null, at: number }} RequestResult */
+/** @typedef {"keep" | "label" | "signal"} Step */
+/** @typedef {{ requested: number | null, suspended: boolean, reason: Outcome | null, at: number, source: "manual" | "auto" | "repair", step?: Step, rolledBack?: boolean }} RequestResult */
 /** @typedef {{ agents: Record<string, { auto: Outcome | null, manual: Outcome | null }>, results: Record<string, RequestResult> }} SuspendState */
 
 /** @param {unknown} value @returns {Record<string, any>} */
@@ -296,7 +326,7 @@ function currentState() {
   return { agents: record(value.agents), results: record(value.results) };
 }
 
-/** @typedef {{ suspended: true } | { suspended: false, reason: Outcome }} SuspendOutcome */
+/** @typedef {{ suspended: true } | { suspended: false, reason: Outcome, step?: Step, rolledBack?: boolean }} SuspendOutcome */
 
 // The reason of a verdict or of a suspension's outcome, null when it passed.
 /** @param {Verdict | SuspendOutcome} result @returns {Outcome | null} */
@@ -479,6 +509,23 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
     if (JSON.stringify(next) !== JSON.stringify(current)) setShared(SUSPEND_STATE, next);
   }
 
+  // Shares an outcome in results. requested: the manual request it answers;
+  // left out, the replaced result's value stays.
+  /**
+   * @param {string} address @param {RequestResult["source"]} source
+   * @param {SuspendOutcome | { suspended: false, reason: Outcome }} outcome
+   * @param {number} now @param {number} [requested]
+   */
+  function share(address, source, outcome, now, requested) {
+    writeState((state) => {
+      /** @type {RequestResult} */
+      const result = { requested: requested ?? state.results[address]?.requested ?? null, suspended: outcome.suspended, reason: reasonOf(outcome), at: now, source };
+      if ("step" in outcome) result.step = outcome.step;
+      if ("rolledBack" in outcome) result.rolledBack = outcome.rolledBack;
+      return { results: { ...state.results, [address]: result } };
+    }, now);
+  }
+
   // The leader handles each new manual request once and shares its result.
   /** @param {number} now */
   async function handleRequests(now) {
@@ -486,12 +533,19 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
       requesting.add(address);
       return serial(async () => {
         const outcome = await suspend(address, { now, manual: true });
-        if (closed) return;
-        /** @type {RequestResult} */
-        const result = { requested, suspended: outcome.suspended, reason: reasonOf(outcome), at: now };
-        writeState((state) => ({ results: { ...state.results, [address]: result } }), now);
+        if (!closed) share(address, "manual", outcome, now, requested);
       }).finally(() => requesting.delete(address));
     }));
+  }
+
+  // Removes a suspension label that no stand-in holds (staleLabel()), after
+  // reading the terminal again, and shares the repair.
+  /** @param {string} address @param {number} now */
+  async function repair(address, now) {
+    const current = await coreTerminal(address);
+    if (closed || !staleLabel(current, now)) return;
+    const removed = await succeeds(hc(["label", address, `${SUSPENDED}=`]));
+    if (!closed) share(address, "repair", { suspended: false, reason: removed ? "repaired" : "failed" }, now);
   }
 
   // The work observe() found, outside render. schedule(ms, run) starts a
@@ -531,8 +585,8 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
    * @returns {Promise<SuspendOutcome>}
    */
   async function suspend(address, { now = clock(), manual = false } = {}) {
-    /** @param {Outcome} reason */
-    const abort = (reason) => ({ suspended: /** @type {false} */ (false), reason });
+    /** @param {Outcome} reason @param {{ step?: Step, rolledBack?: boolean }} [more] @returns {SuspendOutcome} */
+    const abort = (reason, more = {}) => ({ suspended: false, reason, ...more });
     if (!await suspensionInstalled()) return abort("not-installed");
     if (closed) return abort("closed");
     // 1. Read the terminal again: still an unused agent.
@@ -549,7 +603,7 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
     const label = suspension(JSON.stringify({ version: 1, agent: verdict.agent, root, cwd: before.foreground?.cwd, since: now }));
     if (!label) return abort("not-resumable");
     // 2. Keep the terminal, so the signal leaves it live.
-    if (!await succeeds(hc(["keep", address]))) return abort("failed");
+    if (!await succeeds(hc(["keep", address]))) return abort("failed", { step: "keep" });
     if (closed) return abort("closed");
     // 3. Read status and turn again: no change since step 1.
     const after = await coreTerminal(address);
@@ -558,16 +612,17 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
     if (statusOf(after) !== statusOf(before) || after.turn !== before.turn || after.pid !== pid ||
         after.foreground?.pid !== before.foreground?.pid) return abort("changed");
     // 4. The record herdr-shell and the stand-in read.
-    if (!await succeeds(hc(["label", address, `${SUSPENDED}=${JSON.stringify(label)}`]))) return abort("failed");
+    if (!await succeeds(hc(["label", address, `${SUSPENDED}=${JSON.stringify(label)}`]))) return abort("failed", { step: "label" });
     if (closed) return abort("closed");
     // 5. End the main program: hc starts herdr-shell, which starts the stand-in.
     if (!await succeeds(exec("kill", [`-${SIGNAL}`, String(pid)]))) {
       // The signal also fails when the main program already ended: then hc
       // starts herdr-shell, which needs the label to start the stand-in.
+      // A label that cannot come off stays until the leader repairs it.
       const now = await coreTerminal(address);
       const ended = now && (now.state !== "live" || now.pid !== pid);
-      if (!ended) await hc(["label", address, `${SUSPENDED}=`]).catch(() => /** @type {null} */ (null));
-      return abort("failed");
+      const rolledBack = !ended && await succeeds(hc(["label", address, `${SUSPENDED}=`]));
+      return abort("failed", { step: "signal", rolledBack });
     }
     return { suspended: true };
   }
@@ -625,12 +680,20 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
         }
       }
       writeState(() => ({ agents }), now);
+      // Labels that no stand-in holds, also while automatic suspension is off.
+      for (const terminal of terminals()) {
+        if (!staleLabel(terminal, now)) continue;
+        if (closed || !leading(now)) return;
+        await serial(() => repair(terminal.address, now));
+      }
       if (!installed) return;
       for (const address of candidates) {
         if (closed || !leading(now)) return;
         const outcome = await serial(() => suspend(address, { now }));
+        if (closed) return;
         const terminal = terminalAt(address);
         const reason = reasonOf(outcome);
+        if (reason === "failed") share(address, "auto", outcome, now);
         if ((reason === "background" || reason === "processes-unknown") && terminal) {
           heldBack.set(address, { key: processKey(terminal), reason, at: now });
         }

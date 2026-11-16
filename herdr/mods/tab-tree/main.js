@@ -18,10 +18,10 @@
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, panes, terminals, machines, run, openOverlay, theme, shared, setShared, exec, hc, home, layout } from "herdr";
-import { LABEL, RECIPES, createRecovery, remember, claudeLaunch, rememberClaudeLaunch } from "./resume.js";
+import { LABEL, RECIPES, WAKE_MS, createRecovery, remember, claudeLaunch, rememberClaudeLaunch, waking, frontProgram } from "./resume.js";
 import { claudeCandidate, processIdentity } from "./claude-polling.js";
-import { SUSPENDED, suspension } from "./recipes.js";
-import { createSuspender, STANDIN_APP } from "./suspend-policy.js";
+import { SUSPENDED, STANDIN_APP, suspension } from "./recipes.js";
+import { createSuspender } from "./suspend-policy.js";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -278,10 +278,51 @@ export default class TabTree extends View {
   // agent reports its own status (the report outlives the stand-in's
   // replacement by the agent, fact F5), "suspended" while the suspension label
   // is set (herdr-shell runs before the stand-in reports), else null.
+  // A live agent that reports its own status is never shown suspended, even
+  // when a suspension label was left on its terminal (the policy removes it).
+  // render() has already dropped a stale waking report (actual()).
   heldState(p) {
     if (!p.terminal) return null;
     if (p.app === STANDIN_APP && p.status === "working") return "waking";
+    if (p.app && p.app !== STANDIN_APP && p.status) return null;
     return Object.hasOwn(this.labels.get(p.terminal) ?? {}, SUSPENDED) ? "suspended" : null;
+  }
+
+  now() {
+    return Date.now();
+  }
+
+  // The pane as the sidebar shows it. A stand-in's "working" report that is no
+  // longer a wake (waking() in resume.js: the woken agent exited, or never
+  // reported) is dropped: the pane shows what runs in front instead, a shell
+  // (with ↻) or a plain program. cores: terminals() by address.
+  actual(p, now) {
+    const core = p.terminal ? this.cores?.get(p.terminal) : null;
+    if (!core || p.app !== STANDIN_APP || p.status !== "working" || waking(core, now)) return p;
+    const front = frontProgram(core);
+    const shell = Boolean(front?.shell);
+    const program = { key: shell ? "shell" : "program", name: front?.name || "program", icon: null, tint: false, tile: null, color: null, shell, agent: false };
+    return { ...p, status: null, app: null, program };
+  }
+
+  // A wake that ends by the clock changes no terminal, so nothing re-renders
+  // the row: one sleep wakes the view at the earliest end of a wake now shown
+  // (WAKE_MS after it began; a stand-in still in front is checked again
+  // WAKE_MS later). No periodic timer.
+  scheduleWakeEnd(cx, now) {
+    let next = Infinity;
+    for (const core of this.cores.values()) {
+      if (!waking(core, now)) continue;
+      const end = core.status_ms + WAKE_MS;
+      next = Math.min(next, end > now ? end : now + WAKE_MS);
+    }
+    if (next === Infinity || (this.wakeCheck ?? Infinity) <= next) return;
+    this.wakeCheck = next;
+    cx.spawn(async (cx) => {
+      await cx.sleep(next - now);
+      if (this.wakeCheck === next) this.wakeCheck = Infinity;
+      cx.notify();
+    });
   }
 
   // What a row shows where its status goes: "waking…" or 💤 for a terminal a
@@ -551,9 +592,13 @@ export default class TabTree extends View {
   groups(sp, ps, cx) {
     return sp.map((s) => {
       const g = { key: `space:${s.id}`, name: s.name, root: null, machine: s.machine ?? null, spaces: [s], tabs: [] };
-      for (const tab of s.tabs) {
+      for (let tab of s.tabs) {
         const root = this.tree(tab, ps);
         if (!root) continue;
+        if (this.restatus?.has(tab.id)) {
+          const status = ps.filter((p) => p.tab === tab.id).reduce((m, p) => ((RANK[p.status] ?? 0) > (RANK[m] ?? 0) ? p.status : m), null);
+          tab = { ...tab, status };
+        }
         const git = root.p.terminal ? this.gitOf(s.machine, root.p.cwd, cx) : null;
         g.root ??= git?.root ?? null;
         g.tabs.push({ s, tab, root, wt: git?.worktree ?? null });
@@ -710,9 +755,16 @@ export default class TabTree extends View {
     this.observeSuspension(cx);
     const t = theme();
     const collapsed = narrow();
-    const ps = panes();
+    const now = this.now();
+    const cores = terminals();
+    this.cores = new Map(cores.map((t) => [t.address, t]));
+    this.labels = new Map(cores.map((t) => [t.address, t.labels ?? {}]));
+    this.scheduleWakeEnd(cx, now);
+    const raw = panes();
+    const ps = raw.map((p) => this.actual(p, now));
+    // A tab whose pane lost a stale report: its status from its panes again.
+    this.restatus = new Set(ps.filter((p, i) => p !== raw[i]).map((p) => p.tab));
     const sp = spaces();
-    this.labels = new Map(terminals().map((t) => [t.address, t.labels ?? {}]));
     this.colors(sp);
     const groups = this.groups(sp, ps, cx);
     this.publish(groups);

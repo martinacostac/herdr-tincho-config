@@ -284,3 +284,27 @@ test("recovery types nothing while a stand-in wakes its agent, label already rem
   await Promise.all(copy.owner.tasks);
   assert.deepEqual(sends(), []);
 });
+
+// The woken agent never reported: the stand-in's "working" report stays. Once
+// the wake is over (30 s, and the stand-in is not in front), a shell in front
+// gets recovery again; anything else in front (the agent itself, or the wake's
+// sh wrapper running it) gets nothing typed into it.
+const staleWake = (front, ageMs) => ({ ...shell, labels: {}, status: { app: "herdr-standin", state: "working" }, status_ms: Date.now() - ageMs, reported: true,
+  foreground: { pid: 1, argv: front } });
+for (const [what, front, ageMs, typed] of [
+  ["a shell in front, 60 s after the wake", ["/opt/homebrew/bin/fish", "-l"], 60_000, true],
+  ["a shell in front, 5 s after the wake", ["/opt/homebrew/bin/fish", "-l"], 5_000, false],
+  ["the stand-in still in front, 60 s after the wake", ["/data/bin/herdr-standin", "pi", "t7", ""], 60_000, false],
+  ["the woken agent in front, unreported", ["claude", "--resume", "abc"], 60_000, false],
+  ["the wake's sh wrapper in front", ["/bin/sh", "-c", '"$@"; exec "${SHELL:-/bin/sh}"', "sh", "claude", "--resume", "abc"], 60_000, false],
+]) {
+  test(`recovery after a wake whose agent never reported: ${what}`, async () => {
+    reset();
+    respond = ({ kind, args }) => kind === "exec" ? ok({ type: "session", id: record.sessionId }) : args[0][0] === "get" ? ok(staleWake(front, ageMs)) : ok();
+    const copy = sidebar("owner", { immediateSleep: true });
+    copy.click("t7", "pi", labels);
+    for (let i = 0; i < 5; i++) await flush();
+    await Promise.all(copy.owner.tasks);
+    assert.deepEqual(sends(), typed ? [["send", "t7", "pi --session '/fake/session.jsonl' '--thinking' 'high'"]] : []);
+  });
+}

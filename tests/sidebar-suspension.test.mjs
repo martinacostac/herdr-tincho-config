@@ -21,10 +21,12 @@ function element(arg) {
   } });
   return proxy;
 }
+// What the host shows, for tests that render the whole sidebar.
+const world = { spaces: [], panes: [], terminals: [] };
 const host = {
   hc: async () => ({ code: 0, stdout: "{}" }), exec: async () => ({ code: 0, stdout: "" }),
-  spaces: () => [], panes: () => [], terminals: () => [], machines: () => [],
-  run() {}, openOverlay() {}, theme: () => ({}), shared() {}, setShared() {}, home: () => "/home", layout: () => null,
+  spaces: () => world.spaces, panes: () => world.panes, terminals: () => world.terminals, machines: () => [],
+  run() {}, openOverlay() {}, theme: () => ({}), shared() {}, setShared() {}, home: () => "/home", layout: () => world.layout ?? null,
   focused: () => null, settings: () => ({}), readTextFile: async () => null,
 };
 globalThis[Symbol.for("herdr.sidebar-suspension.test-host")] = { host, element };
@@ -118,4 +120,90 @@ test("↻ is never offered on a suspended terminal, but a kept terminal back at 
   assert.ok(!ids(row(shell(), suspended, { hovered: true })).includes("tab-resume-tab7"));
   // An agent that crashed after its first suspension: kept, at a shell, no label.
   assert.ok(ids(row(shell(), { [LABEL]: "pi" }, { hovered: true })).includes("tab-resume-tab7"));
+});
+
+// The whole sidebar, rendered at a fixed time: one tab whose pane p shows the
+// terminal core (as terminals() lists it). Spawned tasks run at once; a sleep
+// is recorded and resolved only by the test.
+const NOW = 1_800_000_000_000;
+function render(p, core, { now = NOW, hovered = false, collapsed = false } = {}) {
+  world.spaces = [{ id: "s1", name: "project", machine: null, active: true, tabs: [{ id: "tab7", named: false, active: true, status: p.status }] }];
+  world.panes = [p];
+  world.terminals = [core];
+  const sleeps = [];
+  const timers = [];
+  let notified = 0;
+  const task = { notify: () => { notified++; }, sleep: (ms) => new Promise((resolve) => sleeps.push({ ms, resolve })), timer: { after() {}, every() {} } };
+  const cx = { notify() {}, timer: { every: (ms) => timers.push(ms), after() {} }, spawn: (run) => { run(task); } };
+  const view = new TabTree();
+  view.init({}, cx);
+  view.now = () => now;
+  view.hovered = hovered ? "tab7" : null;
+  world.layout = collapsed ? { id: "sidebar", size: { px: 60 } } : null;
+  const tree = view.render(cx);
+  return { tree, view, cx, sleeps, timers, notified: () => notified };
+}
+const shellArgv = ["/opt/homebrew/bin/fish", "-l"];
+// A woken agent's terminal: the stand-in reported working at statusMs, then
+// replaced itself with front (the argv of the process in front).
+const wokenCore = (front, statusMs, { pid = 400, frontPid = pid, labels = { [LABEL]: "pi" } } = {}) => ({
+  address: "t7", state: "live", pid, argv: ["/bin/sh", "/data/bin/herdr-shell"], labels,
+  foreground: { pid: frontPid, argv: front, cwd: "/home/project", name: front[0] },
+  status: "working", report: { app: "herdr-standin", state: "working" }, status_ms: statusMs, reported: true,
+});
+const spinner = (root) => nodes(root).some((n) => n.arg === "mods/workspace-chrome/spinner.svg");
+
+test("waking… lasts while the woken agent has not reported, for less than 30 s after the wake", () => {
+  const { tree } = render(standin("working"), wokenCore(["pi", "", ""], NOW - 29_999));
+  assert.ok(texts(tree).includes("waking…"));
+});
+
+test("30 s after a wake whose agent never reported, a shell in front shows as a shell with ↻", () => {
+  // root=shell: the agent exited and the wake's sh replaced itself with $SHELL.
+  const core = wokenCore(shellArgv, NOW - 30_000);
+  const { tree } = render(standin("working"), core, { hovered: true });
+  assert.ok(!texts(tree).includes("waking…"));
+  assert.ok(ids(tree).includes("tab-resume-tab7"));
+  assert.ok(texts(tree).includes("fish"));
+  assert.ok(!spinner(tree), "no working spinner from the stale report");
+});
+
+test("30 s after a wake whose agent never reported, the agent in front shows as a plain program, without ↻", () => {
+  // Claude missed its status handshake: it runs, but never reports.
+  for (const front of [["claude", "--resume", "abc"], ["/bin/sh", "-c", '"$@"; exec "${SHELL:-/bin/sh}"', "sh", "claude", "--resume", "abc"]]) {
+    const { tree } = render(standin("working"), wokenCore(front, NOW - 30_000), { hovered: true });
+    assert.ok(!texts(tree).includes("waking…"), front.join(" "));
+    assert.ok(!ids(tree).includes("tab-resume-tab7"), front.join(" "));
+    assert.ok(texts(tree).includes("claude"), front.join(" "));
+  }
+});
+
+test("waking… holds while the stand-in itself is still in front, however long ago the wake began", () => {
+  const core = wokenCore(["/data/bin/herdr-standin", "pi", "t7", ""], NOW - 10 * 60_000);
+  assert.ok(texts(render(standin("working"), core).tree).includes("waking…"));
+});
+
+test("the narrow sidebar drops a stale waking report too", () => {
+  const { tree } = render(standin("working"), wokenCore(shellArgv, NOW - 30_000), { collapsed: true });
+  assert.ok(!spinner(tree));
+});
+
+test("a waking row re-renders by itself when its 30 s end, with a one-shot sleep and no new timer", async () => {
+  const { sleeps, timers, notified } = render(standin("working"), wokenCore(["pi", "", ""], NOW - 10_000));
+  assert.deepEqual(sleeps.map(({ ms }) => ms), [20_000]);
+  assert.deepEqual(timers, [3000, 10000, 15000]);
+  await new Promise((resolve) => setImmediate(resolve)); // the render's other tasks
+  const before = notified();
+  sleeps[0].resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(notified(), before + 1);
+  // A stale report and a terminal with no wake schedule nothing.
+  assert.deepEqual(render(standin("working"), wokenCore(shellArgv, NOW - 30_000)).sleeps, []);
+  assert.deepEqual(render(agent("idle"), { ...wokenCore(["pi"], NOW - 10_000), status: "idle", report: { app: "pi", state: "idle" } }).sleeps, []);
+});
+
+test("a live agent that reports its own status never shows 💤, even with a leftover suspension label", () => {
+  const r = row(agent("idle"), suspended);
+  assert.ok(!texts(r).includes("💤"));
+  assert.equal(colorOf(r, "Fix the parser"), "FG");
 });

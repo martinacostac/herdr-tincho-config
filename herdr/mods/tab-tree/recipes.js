@@ -9,6 +9,8 @@ export const SESSION = "herdr.claude-session";
 export const PI_RECOVERY = "herdr.pi-recovery";
 export const SUSPENDED = "herdr.suspended";
 export const CLAUDE_OPTIONS = "herdr.claude-options";
+// The app name the stand-in reports over OSC 7501 (suspend/standin.ts).
+export const STANDIN_APP = "herdr-standin";
 
 // Close single quotes around escapes: sh, bash, zsh and fish agree on this,
 // including literal backslashes (fish treats \\ specially inside quotes).

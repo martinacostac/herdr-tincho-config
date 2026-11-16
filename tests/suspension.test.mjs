@@ -184,7 +184,7 @@ test("step 1 aborts when the agent is no longer unused, before anything changes"
 test("step 2 aborts when the terminal cannot be kept", async () => {
   reset();
   failing.add("keep");
-  assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: false, reason: "failed" });
+  assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: false, reason: "failed", step: "keep" });
   assert.deepEqual(actions().map((c) => c[1]), ["get", "keep"]);
 });
 
@@ -207,14 +207,14 @@ test("step 3 aborts when the status or the turn changed after the keep", async (
 test("step 4 aborts when the label cannot be set: no signal", async () => {
   reset();
   failing.add("label");
-  assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: false, reason: "failed" });
+  assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: false, reason: "failed", step: "label" });
   assert.deepEqual(actions().map((c) => c[1]), ["get", "keep", "get", "label"]);
 });
 
 test("step 5 reports a signal that could not be sent, and removes the label from the agent that still runs", async () => {
   reset();
   failing.add("kill");
-  assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: false, reason: "failed" });
+  assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: false, reason: "failed", step: "signal", rolledBack: true });
   assert.deepEqual(actions().map((c) => c[0] === "kill" ? "kill" : c[1]), ["get", "keep", "get", "label", "kill", "get", "label"]);
   // Without the label, the sidebar shows the live agent, not a suspended one.
   assert.deepEqual(actions().at(-1), ["hc", "label", "t7", `${SUSPENDED}=`]);
@@ -227,7 +227,7 @@ test("step 5 keeps the label when the signal failed because the main program alr
     // Steps 1 and 3 see the agent; after the failed signal, hc already
     // started herdr-shell (a new main program), which reads the label.
     core.t7 = [piCore(), piCore(), gone];
-    assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: false, reason: "failed" });
+    assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: false, reason: "failed", step: "signal", rolledBack: false });
     assert.deepEqual(actions().map((c) => c[0] === "kill" ? "kill" : c[1]), ["get", "keep", "get", "label", "kill", "get"], gone.state);
   }
 });
@@ -569,7 +569,7 @@ test("a manual request skips the threshold, and its result is shared with the re
   request("t7", NOW + 100);
   await render(a, "one", NOW + 250);
   assert.deepEqual(suspendedAddresses(), ["t7"]);
-  assert.deepEqual(state().results.t7, { requested: NOW + 100, suspended: true, reason: null, at: NOW + 250 });
+  assert.deepEqual(state().results.t7, { requested: NOW + 100, suspended: true, reason: null, at: NOW + 250, source: "manual" });
   // Handled once.
   calls = [];
   await render(a, "one", NOW + 500);
@@ -585,7 +585,7 @@ test("a manual request whose signal fails is shared as failed, with the label re
   calls = [];
   request("t7", NOW + 100);
   await render(a, "one", NOW + 250);
-  assert.deepEqual(state().results.t7, { requested: NOW + 100, suspended: false, reason: "failed", at: NOW + 250 });
+  assert.deepEqual(state().results.t7, { requested: NOW + 100, suspended: false, reason: "failed", at: NOW + 250, source: "manual", step: "signal", rolledBack: true });
   assert.deepEqual(actions().filter((c) => c[1] === "label").map((c) => c.at(-1).split("=")[1] === ""), [false, true]);
 });
 
@@ -601,7 +601,7 @@ test("a manual request still applies every other rule, and the requester gets th
     const a = copy("a");
     request("t7", NOW);
     await render(a, "one", NOW + 250);
-    assert.deepEqual(state().results.t7, { requested: NOW, suspended: false, reason, at: NOW + 250 }, reason);
+    assert.deepEqual(state().results.t7, { requested: NOW, suspended: false, reason, at: NOW + 250, source: "manual" }, reason);
     assert.deepEqual(actions(), [["hc", "get", "t7", "--json"]], reason);
   }
   resetCopies();
@@ -609,7 +609,7 @@ test("a manual request still applies every other rule, and the requester gets th
   const a = copy("a");
   request("t7", NOW);
   await render(a, "one", NOW + 250);
-  assert.deepEqual(state().results.t7, { requested: NOW, suspended: false, reason: "not-installed", at: NOW + 250 });
+  assert.deepEqual(state().results.t7, { requested: NOW, suspended: false, reason: "not-installed", at: NOW + 250, source: "manual" });
   assert.deepEqual(actions(), []);
 });
 
@@ -706,7 +706,7 @@ test("an agent kept by its background processes gets its process table read agai
   // t7 kept by its dev server; t8 (no child process) suspended.
   assert.deepEqual(suspendedAddresses(), ["t8"]);
   assert.equal(reads(), 2);
-  core.t8 = [claudeCore({ labels: { ...claudeCore().labels, [SUSPENDED]: "{}" } })];
+  core.t8 = [claudeCore({ foreground: { pid: 200, argv: ["herdr-standin", "claude", "t8", ""], cwd: "/work/app" }, labels: { ...claudeCore().labels, [SUSPENDED]: "{}" } })];
   terminalList = terminalList.map((t) => t.address === "t8" ? listed(core.t8[0]) : t);
   await a.pass(NOW + 15_000);
   await a.pass(NOW + 4 * MINUTE);
@@ -714,4 +714,119 @@ test("an agent kept by its background processes gets its process table read agai
   assert.deepEqual(state().agents.t7, { auto: "background", manual: "background" });
   await a.pass(NOW + 5 * MINUTE);
   assert.equal(reads(), 3);
+});
+
+// Repairs (ticket 14). A suspension label on a live terminal that no stand-in
+// holds (the mod closed between steps 4 and 5, or someone set it by hand)
+// is removed by the leader's regular pass, once it is 60 s old.
+const t7Calls = () => actions().filter(([, , address]) => address === "t7").map((c) => c.slice(0, 4));
+const leftover = (since, extra = {}) => piCore({ labels: { ...piCore().labels, [SUSPENDED]: JSON.stringify({ version: 1, agent: "pi", root: "agent", cwd: "/project", since }) }, ...extra });
+const showT7 = (j) => { core.t7 = [j]; terminalList = terminalList.map((t) => t.address === "t7" ? listed(j) : t); };
+
+test("the leader removes a label left on a live agent 60 s after it was set, and shares the repair", async () => {
+  resetCopies();
+  showT7(leftover(NOW - MINUTE));
+  const a = copy("a");
+  await render(a, "one", NOW);
+  await a.pass(NOW);
+  assert.deepEqual(t7Calls(), [["hc", "get", "t7", "--json"], ["hc", "label", "t7", `${SUSPENDED}=`]]);
+  assert.deepEqual(state().results.t7, { requested: null, suspended: false, reason: "repaired", at: NOW, source: "repair" });
+});
+
+test("a label younger than 60 s is left alone", async () => {
+  resetCopies();
+  showT7(leftover(NOW - MINUTE + 1));
+  const a = copy("a");
+  await render(a, "one", NOW);
+  await a.pass(NOW);
+  assert.deepEqual(t7Calls(), []);
+  assert.equal(state().results?.t7, undefined);
+});
+
+test("a label is left alone while its stand-in or herdr-shell is in front, or when hc shows nothing in front", async () => {
+  for (const front of [
+    { pid: 400, argv: ["/data/bin/herdr-standin", "pi", "t7", ""], cwd: "/project" },
+    { pid: 400, argv: ["/bin/sh", "/data/bin/herdr-shell"], cwd: "/project" },
+    undefined,
+  ]) {
+    resetCopies();
+    showT7(leftover(NOW - 10 * MINUTE, { pid: 400, foreground: front, status: null }));
+    const a = copy("a");
+    await render(a, "one", NOW);
+    await a.pass(NOW);
+    assert.deepEqual(t7Calls(), [], JSON.stringify(front));
+  }
+});
+
+test("a label set by hand on a plain shell is removed", async () => {
+  resetCopies();
+  const j = { ...shellCore, labels: { [SUSPENDED]: "1" } };
+  core.t1 = [j];
+  terminalList = terminalList.map((t) => t.address === "t1" ? listed(j) : t);
+  const a = copy("a");
+  await render(a, "one", NOW);
+  await a.pass(NOW);
+  assert.deepEqual(actions().filter(([, , address]) => address === "t1").map((c) => c.slice(0, 4)), [["hc", "get", "t1", "--json"], ["hc", "label", "t1", `${SUSPENDED}=`]]);
+  assert.equal(state().results.t1.reason, "repaired");
+});
+
+test("the repair reads the terminal again: a stand-in that started since the last listing keeps its label", async () => {
+  resetCopies();
+  showT7(leftover(NOW - 10 * MINUTE));
+  core.t7 = [leftover(NOW - 10 * MINUTE, { pid: 400, foreground: { pid: 400, argv: ["herdr-standin", "pi", "t7", ""], cwd: "/project" } })];
+  const a = copy("a");
+  await render(a, "one", NOW);
+  await a.pass(NOW);
+  assert.deepEqual(t7Calls(), [["hc", "get", "t7", "--json"]]);
+});
+
+test("labels are repaired while automatic suspension is off, but only by the leader", async () => {
+  resetCopies();
+  appSettings = { "tincho.suspend": false };
+  showT7(leftover(NOW - 10 * MINUTE));
+  const a = copy("a");
+  const b = copy("b");
+  await render(a, "one", NOW);
+  await render(b, "two", NOW);
+  await b.pass(NOW);
+  assert.deepEqual(t7Calls(), []);
+  await a.pass(NOW);
+  assert.deepEqual(t7Calls().at(-1), ["hc", "label", "t7", `${SUSPENDED}=`]);
+});
+
+// Failures in automatic passes go to the same shared results as requests.
+test("an automatic suspension that fails is shared in the results, with its step", async () => {
+  for (const [fail, answers, expected] of [
+    ["kill", null, { step: "signal", rolledBack: true }],
+    ["kill", [piCore(), piCore(), piCore({ state: "lost" })], { step: "signal", rolledBack: false }],
+    ["keep", null, { step: "keep" }],
+    ["label", null, { step: "label" }],
+  ]) {
+    resetCopies();
+    appSettings = {};
+    windows.one = { ...focusT7, tab: "tab-8", pane: "pane-8", terminal: "t8" }; // t8 stays live
+    failing.add(fail);
+    if (answers) core.t7 = answers;
+    const a = copy("a");
+    await render(a, "one", NOW);
+    await a.pass(NOW);
+    assert.deepEqual(state().results.t7, { requested: null, suspended: false, reason: "failed", at: NOW, source: "auto", ...expected }, `${fail} ${expected.rolledBack}`);
+  }
+});
+
+test("an automatic result keeps the request a manual result answered, so that request is not handled twice", async () => {
+  resetCopies();
+  failing.add("kill");
+  windows.one = { ...focusT7, tab: "tab-8", pane: "pane-8", terminal: "t8" };
+  const a = copy("a");
+  await render(a, "one", NOW);
+  request("t7", NOW + 100);
+  await render(a, "one", NOW + 250);
+  assert.equal(state().results.t7.requested, NOW + 100);
+  assert.equal(state().results.t7.source, "manual");
+  await a.pass(NOW + 15_000);
+  assert.deepEqual(state().results.t7, { requested: NOW + 100, suspended: false, reason: "failed", at: NOW + 15_000, source: "auto", step: "signal", rolledBack: true });
+  calls = [];
+  await render(a, "one", NOW + 15_250);
+  assert.deepEqual(actions(), []);
 });

@@ -6,7 +6,7 @@
 import { hc, exec } from "herdr";
 import { isClaude, processIdentity, claudeLaunchWords } from "./claude-polling.js";
 
-import { LABEL, SESSION, CLAUDE_OPTIONS, PI_RECOVERY, SUSPENDED, piRecovery, holdsPiSession, recoveryLine, claudeOptionsLabel } from "./recipes.js";
+import { LABEL, SESSION, CLAUDE_OPTIONS, PI_RECOVERY, SUSPENDED, STANDIN_APP, piRecovery, holdsPiSession, recoveryLine, claudeOptionsLabel } from "./recipes.js";
 export { LABEL, SESSION, RECIPES } from "./recipes.js";
 
 // Types a command line into the terminal's shell, so the person's own agent
@@ -33,16 +33,63 @@ async function info(address) {
 // The shell is in front again, or the terminal is gone.
 const atShell = (j) => !j || j.state !== "live" || !j.foreground || j.foreground.pid === j.pid;
 
-// The app name the stand-in reports (suspend/standin.ts; suspend-policy.js
-// exports it as STANDIN_APP).
-const STANDIN_APP = "herdr-standin";
+// The shells the app's program table knows (programs.json "shells").
+const SHELLS = new Set(["zsh", "bash", "fish", "sh", "dash", "nu", "pwsh", "powershell", "cmd", "elvish", "xonsh", "tcsh", "csh", "ksh", "ion"]);
+// hc's configured shell (suspend/herdr-shell), a script that sh runs.
+export const HERDR_SHELL = "herdr-shell";
+/** @param {unknown} word */
+const programName = (word) => typeof word === "string" ? word.split(/[\\/]/).pop().replace(/^-/, "") : "";
+
+// What runs in front of a terminal, from its foreground process, never from a
+// status report: { name, shell }, or null when hc gave no foreground argv. A
+// launch wrapper (sh -c '"$@"; exec ...' sh <command>: the stand-in's wake for
+// root=shell, and the app's own launchers) counts as the command it runs.
+// t: from terminals() or hc get.
+/** @param {Record<string, any> | null | undefined} t @returns {{ name: string, shell: boolean } | null} */
+export function frontProgram(t) {
+  let argv = t?.foreground?.argv;
+  if (!Array.isArray(argv) || !argv.length) return null;
+  while (argv.length > 4 && SHELLS.has(programName(argv[0])) && /^-[a-z]*c$/.test(argv[1]) &&
+    typeof argv[2] === "string" && (argv[2].includes('"$@"') || argv[2].startsWith("command $argv[2..]"))) argv = argv.slice(4);
+  if (SHELLS.has(programName(argv[0])) && programName(argv[1]) === HERDR_SHELL) return { name: HERDR_SHELL, shell: false };
+  const name = programName(argv[0]) || (typeof t.foreground.name === "string" ? t.foreground.name : "");
+  return { name, shell: SHELLS.has(name) };
+}
+
+/** @param {Record<string, any> | null | undefined} t */
+export const standinInFront = (t) => frontProgram(t)?.name === STANDIN_APP || t?.foreground?.name === STANDIN_APP;
+
+// The stand-in's own report (terminals() keeps it in report, hc get in
+// status), in any state.
+/** @param {Record<string, any> | null | undefined} t */
+const standinReport = (t) => (t?.report?.app ?? t?.status?.app) === STANDIN_APP;
+/** @param {Record<string, any> | null | undefined} t */
+const stateOf = (t) => typeof t?.status === "string" ? t.status : t?.status?.state ?? t?.report?.state ?? null;
+
+// A wake shows as waking for at most this long after it began, unless the
+// stand-in is still in front.
+export const WAKE_MS = 30_000;
+
+// Whether a stand-in is waking its agent: its "working" report is there (it
+// stays after the stand-in replaced itself, until the woken agent reports,
+// fact F5), and either the stand-in is still in front, or the wake (that
+// report, at status_ms) began less than WAKE_MS ago. After that the report is
+// stale: the woken agent exited, or it never reported (Claude can miss its
+// status handshake), and what runs in front tells what the terminal is.
+/** @param {Record<string, any> | null | undefined} t @param {number} now */
+export function waking(t, now) {
+  if (!standinReport(t) || stateOf(t) !== "working") return false;
+  return standinInFront(t) || (Number.isFinite(t.status_ms) && now - t.status_ms < WAKE_MS);
+}
 
 // A stand-in holds the terminal (GLOSSARY.md): it carries the suspension
-// label, or its own report is still there because it is waking the agent
-// (it removes the label just before it replaces itself, and its "working"
-// report stays until the woken agent reports). A stand-in is the terminal's
-// main program, so atShell() passes for it: recovery must never type into it.
-const standin = (j) => Object.hasOwn(j?.labels ?? {}, SUSPENDED) || j?.status?.app === STANDIN_APP;
+// label, or its own report is still there and no shell is in front, or it is
+// waking the agent (it removes the label just before it replaces itself). A
+// stand-in is the terminal's main program, so atShell() passes for it:
+// recovery must never type into it. A stale wake report with a shell in front
+// (the woken agent exited) does not hold the terminal.
+const standin = (j, now = Date.now()) => Object.hasOwn(j?.labels ?? {}, SUSPENDED) ||
+  (standinReport(j) && (waking(j, now) || !frontProgram(j)?.shell));
 
 async function until(cx, address, ms, done, check) {
   for (let t = 0; t < ms; t += 500) {
