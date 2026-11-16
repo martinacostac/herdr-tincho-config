@@ -22,9 +22,9 @@ function element(arg) {
   return proxy;
 }
 // What the host shows, for tests that render the whole sidebar.
-const world = { spaces: [], panes: [], terminals: [] };
+const world = { spaces: [], panes: [], terminals: [], hc: [] };
 const host = {
-  hc: async () => ({ code: 0, stdout: "{}" }), exec: async () => ({ code: 0, stdout: "" }),
+  hc: async (args) => { world.hc.push(args); return { code: 0, stdout: "{}" }; }, exec: async () => ({ code: 0, stdout: "" }),
   spaces: () => world.spaces, panes: () => world.panes, terminals: () => world.terminals, machines: () => [],
   run() {}, openOverlay() {}, theme: () => ({}), shared() {}, setShared() {}, home: () => "/home", layout: () => world.layout ?? null,
   focused: () => null, settings: () => ({}), readTextFile: async () => null,
@@ -64,10 +64,14 @@ const standin = (status = "idle") => ({ pane: "p7", terminal: "t7", tab: "tab7",
 const agent = (status = "idle") => ({ ...standin(status), app: "pi", program: { key: "pi", name: "Pi", icon: "icons/pi.svg", tint: true, agent: true, shell: false } });
 const shell = () => ({ ...standin(), title: "fish", status: null, app: null, program: { key: "shell", name: "fish", icon: null, tint: false, agent: false, shell: true } });
 
-function row(p, labels, { collapsed = false, hovered = false } = {}) {
+// front: the argv of what runs in front of the terminal (hc's foreground).
+const STANDIN_ARGV = ["/data/bin/herdr-standin", "pi", "t7", ""];
+const HERDR_SHELL_ARGV = ["/bin/sh", "/data/bin/herdr-shell"];
+function row(p, labels, { collapsed = false, hovered = false, front = p.app === "herdr-standin" ? STANDIN_ARGV : ["pi", "", ""] } = {}) {
   const view = new TabTree();
   view.folded = new Set();
   view.labels = new Map([["t7", labels]]);
+  view.cores = new Map([["t7", { address: "t7", state: "live", labels, foreground: { pid: 400, argv: front, name: front[0] } }]]);
   view.hovered = hovered ? "tab7" : null;
   return view.tabRow(theme, { active: false }, { id: "tab7", named: false }, { p, kids: [] }, collapsed, "project", null);
 }
@@ -117,7 +121,9 @@ test("a waking agent shows waking… from the stand-in's working report until th
 test("↻ is never offered on a suspended terminal, but a kept terminal back at a shell still offers it", () => {
   assert.ok(!ids(row(standin(), suspended, { hovered: true })).includes("tab-resume-tab7"));
   // herdr-shell, before the stand-in reports: a shell with the label.
-  assert.ok(!ids(row(shell(), suspended, { hovered: true })).includes("tab-resume-tab7"));
+  assert.ok(!ids(row(shell(), suspended, { hovered: true, front: HERDR_SHELL_ARGV })).includes("tab-resume-tab7"));
+  // A label that no stand-in holds, on a shell: the leader removes it soon.
+  assert.ok(!ids(row(shell(), suspended, { hovered: true, front: ["fish"] })).includes("tab-resume-tab7"));
   // An agent that crashed after its first suspension: kept, at a shell, no label.
   assert.ok(ids(row(shell(), { [LABEL]: "pi" }, { hovered: true })).includes("tab-resume-tab7"));
 });
@@ -206,4 +212,47 @@ test("a live agent that reports its own status never shows 💤, even with a lef
   const r = row(agent("idle"), suspended);
   assert.ok(!texts(r).includes("💤"));
   assert.equal(colorOf(r, "Fix the parser"), "FG");
+});
+
+test("💤 shows while herdr-shell is in front, before the stand-in reports, also under the old agent's report", () => {
+  assert.ok(texts(row(shell(), suspended, { front: HERDR_SHELL_ARGV })).includes("💤"));
+  // The agent's last report stays until the stand-in reports its own.
+  assert.ok(texts(row(agent("idle"), suspended, { front: HERDR_SHELL_ARGV })).includes("💤"));
+  assert.ok(texts(row(agent("idle"), suspended, { front: STANDIN_ARGV })).includes("💤"));
+});
+
+test("a live agent with a leftover label never shows 💤, also before it reports its status", () => {
+  // Claude before its status handshake: the program table knows it, no report.
+  const silent = { ...agent(), status: null, app: null, program: { key: "claude", name: "Claude", icon: "icons/claude.svg", tint: true, agent: true, shell: false } };
+  const r = row(silent, suspended, { front: ["claude", "--resume", "abc"] });
+  assert.ok(!texts(r).includes("💤"));
+  assert.equal(colorOf(r, "Fix the parser"), "FG");
+});
+
+// The 3 s labeling timer (remember()): the last-agent label says which agent
+// ↻ starts again.
+async function labelPass(p, labels) {
+  world.panes = [p];
+  world.terminals = [{ address: "t7", state: "live", labels }];
+  world.hc = [];
+  const handlers = [];
+  const cx = { notify() {}, timer: { every: (ms, run) => handlers.push({ ms, run }), after() {} }, spawn: (run) => { run(cx); } };
+  const view = new TabTree();
+  view.init({}, { ...cx, spawn() {} });
+  handlers.find(({ ms }) => ms === 3000).run(cx);
+  await new Promise((resolve) => setImmediate(resolve));
+  return world.hc.filter(([command]) => command === "label");
+}
+
+test("a running agent is recorded as the terminal's last agent", async () => {
+  assert.deepEqual(await labelPass(agent(), {}), [["label", "t7", `${LABEL}=pi`]]);
+});
+
+test("a stand-in is never recorded as the terminal's last agent", async () => {
+  // The app's generic agent entry describes any program that reports.
+  const reporting = { ...standin(), program: { key: "agent", name: "herdr-standin", icon: null, tint: false, agent: true, shell: false } };
+  assert.deepEqual(await labelPass(reporting, { [LABEL]: "pi", [SUSPENDED]: record }), []);
+  assert.deepEqual(await labelPass(reporting, { [LABEL]: "pi" }), []);
+  // The suspension label is set, but the agent's old report is still there.
+  assert.deepEqual(await labelPass({ ...agent(), program: { key: "agent", name: "agent", icon: null, tint: false, agent: true, shell: false } }, { [LABEL]: "pi", [SUSPENDED]: record }), []);
 });

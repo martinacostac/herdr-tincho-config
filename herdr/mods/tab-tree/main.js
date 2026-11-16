@@ -18,7 +18,7 @@
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, panes, terminals, machines, run, openOverlay, theme, shared, setShared, exec, hc, home, layout } from "herdr";
-import { LABEL, RECIPES, WAKE_MS, createRecovery, remember, claudeLaunch, rememberClaudeLaunch, waking, frontProgram } from "./resume.js";
+import { LABEL, RECIPES, WAKE_MS, HERDR_SHELL, createRecovery, remember, claudeLaunch, rememberClaudeLaunch, waking, frontProgram, standinInFront } from "./resume.js";
 import { claudeCandidate, processIdentity } from "./claude-polling.js";
 import { SUSPENDED, STANDIN_APP, suspension } from "./recipes.js";
 import { createSuspender } from "./suspend-policy.js";
@@ -220,11 +220,15 @@ export default class TabTree extends View {
 
   // Labels each local terminal with the agent running in it (LABEL), so the
   // core still knows it after losing the agent; the ↻ button reads it back.
+  // Never a stand-in: the app's generic agent entry describes it (it reports
+  // its status), and while the suspension label is set the pane may still
+  // show the suspended agent's last report.
   remember(cx) {
     const labels = new Map(terminals().map((t) => [t.address, t.labels ?? {}]));
     for (const p of panes()) {
       const agent = p.program?.agent && p.program.key;
       if (!agent || !p.terminal || p.terminal.includes("/") || !labels.has(p.terminal)) continue;
+      if (p.app === STANDIN_APP || Object.hasOwn(labels.get(p.terminal), SUSPENDED)) continue;
       const key = `${p.terminal}=${agent}`;
       if (labels.get(p.terminal)[LABEL] === agent || this.labeling.has(key)) continue;
       this.labeling.add(key);
@@ -236,8 +240,8 @@ export default class TabTree extends View {
   }
 
   // Labels each local terminal running Claude with its session id (SESSION)
-  // and launch options (CLAUDE_OPTIONS), so ↻ and waking resume that exact
-  // conversation the same way. One pass at a time, terminals in turn.
+  // and launch options (CLAUDE_OPTIONS), so recovery (↻) and a wake continue
+  // that exact conversation, started the same way. One pass at a time, terminals in turn.
   rememberSessions(cx) {
     if (this.sessionsBusy) return;
     // Every core terminal, not panes(): sub-agents run in terminals no pane lists.
@@ -283,15 +287,21 @@ export default class TabTree extends View {
   // Stand-in): "waking" from the stand-in's working report until the woken
   // agent reports its own status (the report outlives the stand-in's
   // replacement by the agent, fact F5), "suspended" while the suspension label
-  // is set (herdr-shell runs before the stand-in reports), else null.
-  // A live agent that reports its own status is never shown suspended, even
-  // when a suspension label was left on its terminal (the policy removes it).
+  // is set and the stand-in or herdr-shell (which starts it) runs in front,
+  // else null. A live agent is never shown suspended, even when a suspension
+  // label was left on its terminal (the policy removes it).
   // render() has already dropped a stale waking report (shownPane()).
   heldState(p) {
     if (!p.terminal) return null;
     if (p.app === STANDIN_APP && p.status === "working") return "waking";
-    if (p.app && p.app !== STANDIN_APP && p.status) return null;
-    return Object.hasOwn(this.labels.get(p.terminal) ?? {}, SUSPENDED) ? "suspended" : null;
+    if (!this.suspensionLabel(p.terminal)) return null;
+    const core = this.cores?.get(p.terminal);
+    return standinInFront(core) || frontProgram(core)?.name === HERDR_SHELL ? "suspended" : null;
+  }
+
+  /** @param {string} address */
+  suspensionLabel(address) {
+    return Object.hasOwn(this.labels.get(address) ?? {}, SUSPENDED);
   }
 
   now() {
@@ -409,8 +419,9 @@ export default class TabTree extends View {
     const kidsOpen = root.kids.length > 0 && !this.folded.has(tab.id);
     const held = this.heldState(p);
     // Back at a shell prompt: ↻ recovers the agent the terminal last ran. Never
-    // in a stand-in: it is the main program, so it looks like a shell.
-    const local = !held && d.k === "shell" && p.terminal && !p.terminal.includes("/");
+    // in a stand-in: it is the main program, so it looks like a shell. Nor
+    // while the suspension label is set: recovery refuses to type then.
+    const local = !held && d.k === "shell" && p.terminal && !p.terminal.includes("/") && !this.suspensionLabel(p.terminal);
     const last = local ? this.labels.get(p.terminal)?.[LABEL] : null;
     const agent = last && RECIPES[last] ? last : null;
     const hovered = this.hovered === tab.id;

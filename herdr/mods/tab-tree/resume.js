@@ -151,11 +151,8 @@ export function createRecovery() {
         const recovery = piRecovery(labels[PI_RECOVERY]);
         let picker = false;
         if (recovery?.sessionFile) {
-          // Missing or empty files create NEW Pi conversations. Check a bounded
-          // header, including its ID, so replaced files cannot resume another one.
-          const file = await exec("sh", ["-c", 'test -f "$1" && head -c 4096 "$1"', "sh", recovery.sessionFile]).catch(() => null);
+          picker = !await piSessionHeld(recovery);
           check();
-          picker = file?.code !== 0 || !holdsPiSession(file.stdout, recovery.sessionId);
         }
         const current = await info(address);
         check();
@@ -164,6 +161,27 @@ export function createRecovery() {
       });
     },
   };
+}
+
+// Whether the session file a Pi record names holds that session. A missing or
+// empty file would start a NEW Pi conversation; a bounded header, with its ID,
+// shows that a replaced file is not another conversation.
+/** @param {{ sessionId: string, sessionFile?: string | null } | null} recovery */
+export async function piSessionHeld(recovery) {
+  if (!recovery?.sessionFile) return false;
+  const file = await exec("sh", ["-c", 'test -f "$1" && head -c 4096 "$1"', "sh", recovery.sessionFile]).catch(() => /** @type {null} */ (null));
+  return file?.code === 0 && holdsPiSession(file.stdout, recovery.sessionId);
+}
+
+// Whether Claude keeps a transcript of a session: <id>.jsonl in any project
+// folder under ~/.claude/projects. A Claude that never got a prompt names a
+// session in ~/.claude/sessions that has none, and --resume cannot find it.
+/** @param {unknown} id */
+export async function claudeTranscript(id) {
+  if (typeof id !== "string" || !id || /[\x00-\x1f\x7f/]/.test(id)) return false;
+  const script = 'for f in "$HOME"/.claude/projects/*/"$1.jsonl"; do test -f "$f" && exit 0; done; exit 1';
+  const r = await exec("sh", ["-c", script, "sh", id]).catch(() => /** @type {null} */ (null));
+  return r?.code === 0;
 }
 
 export function remember(address, agent) {

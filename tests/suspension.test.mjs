@@ -74,7 +74,10 @@ const { createSuspender, SUSPEND_REQUESTS, SUSPEND_STATE } = policy;
 
 const MINUTE = 60_000;
 const NOW = 1_800_000_000_000;
-const piRecord = JSON.stringify({ version: 1, sessionId: "session-1", sessionFile: "/sessions/one.jsonl", cwd: "/project", args: [] });
+// Pi's session file of session-1 (makeHome() writes Claude's transcript).
+const sessions = mkdtempSync(join(tmpdir(), "suspension-test-sessions-"));
+writeFileSync(join(sessions, "one.jsonl"), JSON.stringify({ type: "session", version: 3, id: "session-1", cwd: "/project" }) + "\n");
+const piRecord = JSON.stringify({ version: 1, sessionId: "session-1", sessionFile: join(sessions, "one.jsonl"), cwd: "/project", args: [] });
 
 // t7: a Pi agent that hc started directly (its main program is the agent).
 // t8: a Claude agent inside fish (the shell is the main program). Both idle
@@ -112,6 +115,8 @@ function makeHome({ standin = true, shell = true, config } = {}) {
   mkdirSync(join(home, ".config/herdr-core"), { recursive: true });
   const text = config === undefined ? `restore_screen = true\nshell = ["${bin}/herdr-shell"]\n` : config;
   if (text !== null) writeFileSync(join(home, ".config/herdr-core/config.toml"), text);
+  mkdirSync(join(home, ".claude/projects/-work-app"), { recursive: true });
+  writeFileSync(join(home, ".claude/projects/-work-app/claude-session.jsonl"), '{"type":"user"}\n');
   return bin;
 }
 
@@ -139,18 +144,41 @@ function reset() {
 const actions = () => calls.filter(([command]) => command !== "ps");
 const labelOf = (call) => JSON.parse(call.at(-1).slice(`${SUSPENDED}=`.length));
 
-test.after(() => { if (home) rmSync(home, { recursive: true, force: true }); });
+test.after(() => { if (home) rmSync(home, { recursive: true, force: true }); rmSync(sessions, { recursive: true, force: true }); });
 
 test("a suspension checks, keeps, checks again, labels and signals, in that order", async () => {
   reset();
   const s = createSuspender({ id: "a" });
   assert.deepEqual(await s.suspend("t7", { now: NOW }), { suspended: true });
   assert.deepEqual(actions().map((c) => c.slice(0, 3)), [
-    ["hc", "get", "t7"], ["hc", "keep", "t7"], ["hc", "get", "t7"], ["hc", "label", "t7"], ["kill", "-TERM", "100"],
+    ["hc", "get", "t7"], ["hc", "keep", "t7"], ["hc", "get", "t7"], ["hc", "label", "t7"], ["kill", "-KILL", "100"], ["kill", "-TERM", "101"],
   ]);
   const label = actions()[3];
   assert.equal(label.length, 4);
   assert.deepEqual(labelOf(label), { version: 1, agent: "pi", root: "agent", cwd: "/project", since: NOW });
+});
+
+// Pi (and Claude) turn SIGTERM and SIGHUP into an exit with code 0, which hc
+// treats as final: the terminal would end. SIGKILL cannot become an exit code.
+test("an agent that is the terminal's main program gets SIGKILL, then its helpers from the process snapshot get SIGTERM", async () => {
+  reset();
+  processRows.push([102, 100, "uvx some-mcp-server"], [103, 102, "python -m server"]);
+  assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: true });
+  assert.deepEqual(actions().filter(([command]) => command === "kill"), [["kill", "-KILL", "100"], ["kill", "-TERM", "101", "102"]]);
+  // Claude as the main program takes the same path; without helpers, only SIGKILL.
+  reset();
+  core.t8 = [claudeCore({ pid: 201, argv: ["claude"] })];
+  processRows = processRows.filter(([pid]) => pid !== 200).map((r) => r[0] === 201 ? [201, 90, "claude"] : r);
+  assert.deepEqual(await createSuspender({ id: "a" }).suspend("t8", { now: NOW }), { suspended: true });
+  assert.deepEqual(actions().filter(([command]) => command === "kill"), [["kill", "-KILL", "201"]]);
+  assert.equal(labelOf(actions().find((c) => c[1] === "label")).root, "agent");
+});
+
+test("no helper gets a signal when the main program's SIGKILL fails", async () => {
+  reset();
+  failing.add("kill");
+  await createSuspender({ id: "a" }).suspend("t7", { now: NOW });
+  assert.deepEqual(actions().filter(([command]) => command === "kill"), [["kill", "-KILL", "100"]]);
 });
 
 test("an agent inside a shell is recorded with root shell, and the shell gets SIGTERM (fact F3)", async () => {
@@ -159,8 +187,9 @@ test("an agent inside a shell is recorded with root shell, and the shell gets SI
   assert.deepEqual(await s.suspend("t8", { now: NOW }), { suspended: true });
   const done = actions();
   assert.deepEqual(labelOf(done[3]), { version: 1, agent: "claude", root: "shell", cwd: "/work/app", since: NOW });
-  // The terminal's main program (fish, 200), never the agent in front (201).
-  assert.deepEqual(done[4], ["kill", "-TERM", "200"]);
+  // The terminal's main program (fish, 200), never the agent in front (201),
+  // and nothing else.
+  assert.deepEqual(done.slice(4), [["kill", "-TERM", "200"]]);
 });
 
 test("step 1 aborts when the agent is no longer unused, before anything changes", async () => {
@@ -335,7 +364,7 @@ test("with two copies, only one leads and acts", async () => {
   assert.deepEqual(actions(), []);
   await inWindow("one", () => a.pass(NOW));
   assert.deepEqual(suspendedAddresses(), ["t7", "t8"]);
-  assert.deepEqual(actions().filter(([c]) => c === "kill"), [["kill", "-TERM", "100"], ["kill", "-TERM", "200"]]);
+  assert.deepEqual(actions().filter(([c]) => c === "kill"), [["kill", "-KILL", "100"], ["kill", "-TERM", "101"], ["kill", "-TERM", "200"]]);
 });
 
 test("a copy leads only once its own entry is published, and a stale or closed leader hands over", async () => {
@@ -694,6 +723,62 @@ test("a pass starts no process while no agent is past its threshold", async () =
   for (let i = 0; i <= 20; i++) await a.pass(NOW + i * 15_000);
   assert.deepEqual(calls, []);
   assert.equal(shRuns, runs);
+});
+
+test("while suspension is not installed, the installed check runs at most once every five minutes", async () => {
+  resetCopies();
+  makeHome({ standin: false });
+  const a = copy("a");
+  await render(a, "one", NOW);
+  const runs = shRuns;
+  for (let i = 0; i < 20; i++) await a.pass(NOW + i * 15_000);
+  assert.equal(shRuns - runs, 1);
+  assert.deepEqual(state().agents.t7, { auto: "not-installed", manual: "not-installed" });
+  await a.pass(NOW + 5 * MINUTE);
+  assert.equal(shRuns - runs, 2);
+  // Installed since: the next check finds it, and the agents are suspended.
+  makeHome();
+  await a.pass(NOW + 10 * MINUTE);
+  assert.deepEqual(suspendedAddresses(), ["t7", "t8"]);
+});
+
+test("the leader removes requests older than a minute, and requests that can never act, from the shared requests", async () => {
+  resetCopies();
+  appSettings = { "tincho.suspend": false };
+  const a = copy("a");
+  const b = copy("b");
+  await render(a, "one", NOW);
+  await render(b, "two", NOW);
+  const requests = { t7: NOW - MINUTE, t8: NOW - MINUTE + 1, t1: "soon", t9: NOW + 10 * MINUTE };
+  store.set(SUSPEND_REQUESTS, requests);
+  await inWindow("two", () => b.pass(NOW));
+  assert.deepEqual(store.get(SUSPEND_REQUESTS), requests);
+  await inWindow("one", () => a.pass(NOW));
+  assert.deepEqual(store.get(SUSPEND_REQUESTS), { t8: NOW - MINUTE + 1 });
+  await inWindow("one", () => a.pass(NOW + 15_000));
+  assert.deepEqual(store.get(SUSPEND_REQUESTS), {});
+});
+
+test("an agent whose session is not on disk is not suspended, and is checked again only after five minutes", async () => {
+  resetCopies();
+  rmSync(join(home, ".claude/projects/-work-app/claude-session.jsonl"));
+  const a = copy("a");
+  await render(a, "one", NOW);
+  await a.pass(NOW);
+  assert.deepEqual(suspendedAddresses(), ["t7"]);
+  const t8Gets = () => actions().filter((c) => c[1] === "get" && c[2] === "t8").length;
+  assert.equal(t8Gets(), 1);
+  await a.pass(NOW + 15_000);
+  await a.pass(NOW + 4 * MINUTE);
+  assert.equal(t8Gets(), 1);
+  assert.deepEqual(state().agents.t8, { auto: "not-resumable", manual: "not-resumable" });
+  await a.pass(NOW + 5 * MINUTE);
+  assert.equal(t8Gets(), 2);
+  // A manual request reads it again at once.
+  request("t8", NOW + 5 * MINUTE);
+  await render(a, "one", NOW + 5 * MINUTE + 250);
+  assert.equal(state().results.t8.reason, "not-resumable");
+  assert.equal(t8Gets(), 3);
 });
 
 test("an agent kept by its background processes gets its process table read again only after five minutes", async () => {

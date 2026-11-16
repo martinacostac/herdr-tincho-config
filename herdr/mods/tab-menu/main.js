@@ -17,9 +17,13 @@ import { run, props, closeOverlay, openOverlay, theme, keys, terminals, spaces, 
 // each other, so the names, record() and suspendState() (its currentState())
 // are repeated here.
 // REQUESTS: { [address]: ms }, a manual suspension request per terminal; the
-// leader ignores a request older than REQUEST_MS.
+// leader ignores a request older than REQUEST_MS, and its pass removes it.
 // STATE: { agents: { [address]: { auto, manual } }, results: { [address]:
-// { requested, suspended, reason, at } } }, written by the leading copy.
+// { requested, suspended, reason, at, source, step?, rolledBack? } } },
+// written by the leading copy. source: "manual" (a request's result),
+// "auto" (a failed automatic suspension) or "repair" (a stale label
+// removed); step: where a suspension failed ("keep", "label" or "signal");
+// rolledBack: whether the label came off again after a failed signal.
 const SUSPEND_REQUESTS = "tincho.suspend.requests";
 const SUSPEND_STATE = "tincho.suspend.state";
 const REQUEST_MS = 60_000;

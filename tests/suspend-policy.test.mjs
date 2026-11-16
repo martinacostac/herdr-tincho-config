@@ -1,10 +1,27 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { registerHooks } from "node:module";
+import { execFile } from "node:child_process";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { LABEL, PI_RECOVERY, SESSION } from "../herdr/mods/tab-tree/recipes.js";
 
 // Mock only the Herdr host: app settings, focus, panes and the process table
-// (`ps`). The real rules run unchanged.
+// (`ps`). `sh` runs for real against a disposable home, so the session checks
+// see real files. The real rules run unchanged.
+const home = mkdtempSync(join(tmpdir(), "suspend-policy-test-"));
+test.after(() => rmSync(home, { recursive: true, force: true }));
+// Claude's transcript of "claude-session" (in another project's folder: any
+// folder counts), and Pi's session file of "session-1".
+mkdirSync(join(home, ".claude/projects/-elsewhere"), { recursive: true });
+writeFileSync(join(home, ".claude/projects/-elsewhere/claude-session.jsonl"), '{"type":"user"}\n');
+mkdirSync(join(home, "sessions"));
+const piHeader = (id) => JSON.stringify({ type: "session", version: 3, id, cwd: "/project" }) + "\n";
+writeFileSync(join(home, "sessions/one.jsonl"), piHeader("session-1") + '{"type":"message"}\n');
+const runSh = (args) => new Promise((resolve) => {
+  execFile("sh", args, { env: { HOME: home, PATH: process.env.PATH } }, (error, stdout, stderr) => resolve({ code: error ? (typeof error.code === "number" ? error.code : 1) : 0, stdout, stderr }));
+});
 let appSettings;
 let focus;
 let paneList;
@@ -17,6 +34,7 @@ globalThis[hostKey] = {
   panes: () => structuredClone(paneList),
   exec: async (command, args) => {
     execs.push([command, args]);
+    if (command === "sh") return runSh(args);
     if (command !== "ps") throw new Error(`unexpected exec: ${command}`);
     return processTable();
   },
@@ -39,7 +57,7 @@ hook.deregister();
 
 const MINUTE = 60_000;
 const NOW = 1_800_000_000_000;
-const piRecord = JSON.stringify({ version: 1, sessionId: "session-1", sessionFile: "/sessions/one.jsonl", cwd: "/project", args: [] });
+const piRecord = JSON.stringify({ version: 1, sessionId: "session-1", sessionFile: join(home, "sessions/one.jsonl"), cwd: "/project", args: [] });
 
 // A Pi agent that hc started directly (its main program is the agent), idle
 // for an hour, in tab "tab-2" while "tab-1" is focused.
@@ -111,6 +129,36 @@ test("an agent that cannot be started again from its session is not resumable", 
   for (const terminal of cases) {
     assert.deepEqual(await unusedAgent(terminal, { now: NOW }), { unused: false, reason: "not-resumable" }, JSON.stringify(terminal));
   }
+});
+
+test("a Claude session counts as resumable only when its transcript exists", async () => {
+  reset();
+  processTable = table(claudeProcesses);
+  // A Claude that never got a prompt names a session without a transcript.
+  for (const id of ["other-session", "../-elsewhere/claude-session", "-elsewhere/claude-session", "*"]) {
+    const terminal = claude({ labels: { [LABEL]: "claude", [SESSION]: id } });
+    assert.deepEqual(await unusedAgent(terminal, { now: NOW }), { unused: false, reason: "not-resumable" }, id);
+    assert.deepEqual(await unusedAgent(terminal, { now: NOW, manual: true }), { unused: false, reason: "not-resumable" }, id);
+  }
+});
+
+test("a Pi record counts as resumable only when its session file holds the recorded session", async () => {
+  reset();
+  writeFileSync(join(home, "sessions/other.jsonl"), piHeader("session-2"));
+  writeFileSync(join(home, "sessions/empty.jsonl"), "");
+  for (const file of ["missing.jsonl", "other.jsonl", "empty.jsonl"]) {
+    const record = JSON.stringify({ version: 1, sessionId: "session-1", sessionFile: join(home, "sessions", file), cwd: "/project", args: [] });
+    const terminal = pi({ labels: { [LABEL]: "pi", [PI_RECOVERY]: record } });
+    assert.deepEqual(await unusedAgent(terminal, { now: NOW }), { unused: false, reason: "not-resumable" }, file);
+  }
+});
+
+test("the session on disk is read only after every rule that reads no file passed", async () => {
+  reset();
+  const noFile = JSON.stringify({ version: 1, sessionId: "session-1", sessionFile: join(home, "sessions/missing.jsonl"), cwd: "/project", args: [] });
+  const terminal = pi({ status: "working", labels: { [LABEL]: "pi", [PI_RECOVERY]: noFile } });
+  assert.deepEqual(await unusedAgent(terminal, { now: NOW }), { unused: false, reason: "working" });
+  assert.deepEqual(execs, []);
 });
 
 test("working and blocked agents are never unused, each with its own reason", async () => {
@@ -299,12 +347,29 @@ test("a custom allow-list marks other command lines as helpers by containment, a
   assert.deepEqual(await unusedAgent(pi(), { now: NOW }), { unused: false, reason: "background" });
 });
 
-test("only the agent's own descendants count: the shell that hosts it and other processes do not", async () => {
+test("only the agent's descendants and the hosting shell's other children count, not other processes", async () => {
   reset();
-  processTable = table([...claudeProcesses, [202, 200, "vim notes.md"], [300, 1, "npm run dev"]]);
+  processTable = table([...claudeProcesses, [300, 1, "npm run dev"], [301, 300, "node vite"]]);
   assert.deepEqual(await unusedAgent(claude(), { now: NOW }), { unused: true, agent: "claude" });
   processTable = table([...claudeProcesses, [203, 201, "npm run dev"]]);
   assert.deepEqual(await unusedAgent(claude(), { now: NOW }), { unused: false, reason: "background" });
+});
+
+// The signal goes to the hosting shell: a job started in it before the agent
+// (npm run dev &) would end with it.
+test("a background job in the shell that hosts the agent keeps the agent in use, unless it is a helper", async () => {
+  reset();
+  processTable = table([...claudeProcesses, [202, 200, "npm run dev"]]);
+  assert.deepEqual(await unusedAgent(claude(), { now: NOW }), { unused: false, reason: "background" });
+  assert.deepEqual(await unusedAgent(claude(), { now: NOW, manual: true }), { unused: false, reason: "background" });
+  processTable = table([...claudeProcesses, [202, 200, "uvx some-mcp-server"], [203, 202, "python -m server"]]);
+  assert.deepEqual(await unusedAgent(claude(), { now: NOW }), { unused: true, agent: "claude" });
+  // A launch wrapper between the shell and the agent is the agent's own line.
+  processTable = table([[1, 0, "/sbin/launchd"], [200, 1, "fish"], [210, 200, "sh -c claude"], [201, 210, "claude"]]);
+  assert.deepEqual(await unusedAgent(claude(), { now: NOW }), { unused: true, agent: "claude" });
+  // An agent that is not under the shell hc names: its processes are unknown.
+  processTable = table([[1, 0, "/sbin/launchd"], [200, 1, "fish"], [201, 1, "claude"]]);
+  assert.deepEqual(await unusedAgent(claude(), { now: NOW }), { unused: false, reason: "processes-unknown" });
 });
 
 test("child terminals do not prevent eligibility", async () => {
