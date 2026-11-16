@@ -89,3 +89,9 @@ test("a Pi session file holds the recorded session only when its header names it
 test("a Pi session check without a recorded id never matches", () => {
   for (const id of [undefined, null, ""]) assert.equal(holdsPiSession(header({ id }), id), false, String(id));
 });
+
+test("the shared recipe module imports nothing, so the stand-in can build it without the Herdr host", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const source = await readFile(new URL("../herdr/mods/tab-tree/recipes.js", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /^\s*import\b|\bimport\s*\(|\brequire\s*\(/m);
+});

@@ -1,7 +1,7 @@
 // Bringing an agent back in a terminal that lost it (hc server stop, a crash,
 // a reboot). herdr-core keeps nothing of the program it lost: the mod labels
 // each terminal with the agent it last ran (LABEL, kept by the core across
-// restarts), and recipes.js says how each agent resumes.
+// restarts), and recipes.js says how each agent starts again.
 
 import { hc, exec } from "herdr";
 import { isClaude, processIdentity } from "./claude-polling.js";

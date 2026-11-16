@@ -34,7 +34,7 @@ export function piRecovery(raw) {
 export function suspension(raw) {
   try {
     const value = JSON.parse(raw);
-    if (value?.version !== 1 || !["claude", "pi"].includes(value.agent) || !["shell", "agent"].includes(value.root)) return null;
+    if (value?.version !== 1 || !Object.hasOwn(STARTS, value.agent) || !["shell", "agent"].includes(value.root)) return null;
     if (!absolute(value.cwd) || !Number.isSafeInteger(value.since) || value.since < 0) return null;
     return { version: 1, agent: value.agent, root: value.root, cwd: value.cwd, since: value.since };
   } catch { return null; }
@@ -76,11 +76,11 @@ const INPUTS = {
   pi: (labels, { picker }) => ({ recovery: piRecovery(labels[PI_RECOVERY]), picker }),
 };
 
-const start = (agent, labels, options) =>
+const startFor = (agent, labels, options) =>
   Object.hasOwn(STARTS, agent) ? STARTS[agent](INPUTS[agent](labels ?? {}, options ?? {})) : null;
 
 // Typed into a shell: the recipe's own words bare, every recorded word quoted.
-const line = ({ cwd, command, words }) =>
+const shellLine = ({ cwd, command, words }) =>
   `${cwd ? `cd ${shellQuote(cwd)} && ` : ""}${[...command, ...words.map(shellQuote)].join(" ")}`;
 
 // The folder and the command word list that start the agent, or null for an
@@ -91,17 +91,17 @@ const line = ({ cwd, command, words }) =>
  * @returns {{ cwd: string | null, argv: string[] } | null}
  */
 export function recipe(agent, labels, options) {
-  const s = start(agent, labels, options);
-  return s && { cwd: s.cwd, argv: [...s.command, ...s.words] };
+  const start = startFor(agent, labels, options);
+  return start && { cwd: start.cwd, argv: [...start.command, ...start.words] };
 }
 
 // The same start as one shell line, as recovery types it.
 /** @param {string} agent @param {Record<string, string> | undefined} labels @param {StartOptions} [options] @returns {string | null} */
 export function recoveryLine(agent, labels, options) {
-  const s = start(agent, labels, options);
-  return s && line(s);
+  const start = startFor(agent, labels, options);
+  return start && shellLine(start);
 }
 
 // The shell line from already parsed records: Claude's { session, tab }, Pi's
 // { recovery, picker }. Its keys are the agents that have a recipe.
-export const RECIPES = Object.fromEntries(Object.entries(STARTS).map(([agent, s]) => [agent, (input) => line(s(input))]));
+export const RECIPES = Object.fromEntries(Object.entries(STARTS).map(([agent, build]) => [agent, (input) => shellLine(build(input))]));
