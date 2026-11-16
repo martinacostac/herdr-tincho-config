@@ -374,7 +374,7 @@ One copy of `tab-tree` acts, even with several windows open. Right before it
 suspends an agent, it reads the terminal again and stops if anything changed.
 Suspension happens only while the Herdr app is open.
 
-### Settings
+### Suspension settings
 
 In `~/.config/herdr-app/settings.json` (set by hand, see [Settings](#settings)):
 
@@ -436,19 +436,19 @@ before.
 A message sent while the terminal switches to the stand-in is refused by hc
 as `unavailable`. The sender can send it again.
 
-When the session is gone (Pi's file is missing or has another id, or Claude
-has no session id), the stand-in doesn't wake the agent. It saves the
+When the session is gone (Pi's record names no session file, or the file is
+missing or has another id, or Claude has no session id), the stand-in doesn't wake the agent. It saves the
 messages in `${XDG_STATE_HOME:-~/.local/state}/herdr-tincho-config/undelivered/`,
 shows the file's path and reports `blocked`, so hc tells the parent.
 
 ### Claude launch options
 
 Recovery and waking start Claude with the options it was started with:
-`--resume` alone doesn't restore the model. Every 10 seconds, with the session
+`--resume` alone doesn't keep the model. Every 10 seconds, with the session
 id, the mod reads Claude's command line, keeps only known reusable options,
 and stores them in the `herdr.claude-options` label. ↻ then types, for
-example, `claude --model haiku --resume '<id>'`. Without options the line is
-the same as before.
+example, `claude '--model' 'haiku' --resume '<id>'`. Without options the line
+is the same as before.
 
 - Kept: `--model`, `--permission-mode`, `--effort`, `--fallback-model`,
   `--agent`, `--setting-sources`, `--plugin-dir` and a few more with one
@@ -461,19 +461,24 @@ the same as before.
   selectors (`--continue`, `--session-id`, `--name`).
 - An unknown option, or one with an optional value (`--resume`, `--debug`,
   `--worktree`, ...), stops capture. The words after it are dropped.
+- A bare word in the middle of a list (`--add-dir /x text --model m`) is kept
+  as a folder, as Claude itself reads it.
 
 ### Restarts, crashes and repairs
 
 - Suspended agents stay suspended through `hc server stop` and the next core
-  start (checked on a disposable core, fact F1). The terminal keeps its
-  address and labels, and starts the stand-in again. A reboot goes through
-  the same core start.
+  start (checked on a disposable core, fact F1 in the
+  [plan](plans/agent-suspension.md)). The terminal keeps its address and
+  labels, and starts the stand-in again. A reboot should behave the same,
+  since it also ends in a core start, but that wasn't checked.
 - Suspension keeps the terminal (`hc keep`). If the agent crashes after it
   woke, the terminal stays, with a shell and ↻.
 - A live agent never shows 💤. When a terminal keeps the suspension label but
-  an agent runs in it (a failed step, or a label set by hand), `tab-tree`
-  removes the label after 60 s. An open menu then says "Can't suspend: stale
-  suspension label removed". A "waking…" that no agent ends clears after 30 s.
+  another program runs in it (a failed step, or a label set by hand),
+  `tab-tree` removes the label at its next pass once the label is 60 s old.
+  The stand-in and `herdr-shell` are left alone. A menu that just asked to
+  suspend that agent then says "Can't suspend: stale suspension label
+  removed". A "waking…" that no agent ends clears after 30 s.
 
 ### Install
 
@@ -497,8 +502,9 @@ the same as before.
   key. A different `shell` value is reported as a conflict and kept;
   `--force` replaces it and keeps the old file as `config.toml.orig`. A file
   it can't read (a multi-line string, for example) is reported and never
-  edited: set the line by hand. hc uses the new shell for programs it starts
-  after that; running programs keep running.
+  edited: set the line by hand. If the stand-in isn't installed (its first
+  build failed), the key stays as it is. hc uses the new shell for programs
+  it starts after that; running programs keep running.
 
 `herdr-shell` and `herdr-standin` are program files: a new version replaces
 them even when they were changed on this machine.
@@ -514,7 +520,8 @@ suspended ("suspension not installed") until both programs are installed and
 ### Idle work
 
 - One 15 s pass in each `tab-tree` copy; only the leading copy acts. It
-  starts no process unless an agent is past its threshold.
+  starts no process unless an agent is past its threshold, a **Suspend now**
+  request waits, or a stale label needs removing.
 - A 60 s heartbeat in Herdr's shared state keeps the leader choice. Every mod
   re-renders then.
 - One 1 s timer per focused suspended tab, cancelled when the focus moves.
@@ -532,6 +539,9 @@ suspended ("suspension not installed") until both programs are installed and
   The standard compile covers stable Bun.
 - Only Claude and Pi agents with session labels on this machine are
   suspended.
+- hc has no hook that runs a command when a message reaches a terminal. Such
+  a hook would make the stand-in unnecessary; it's worth requesting
+  ([ADR 0001](docs/adr/0001-suspended-agents-reached-through-a-stand-in.md)).
 - Not checked: a first-run Claude dialog (folder trust) during a wake may
   drop the first prompt. Claude then reports `blocked`, and hc tells the
   parent. A folder that already has a session is already trusted.

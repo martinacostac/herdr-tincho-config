@@ -50,6 +50,8 @@ consolidated below.
   suspension off).
 - Sidebar 💤 and "waking…" states, and **Suspend now** and **Never suspend**
   items in the tab menu, with the reason when an agent cannot be suspended.
+  Stale suspension labels and "waking…" states that no agent ends are
+  cleared on their own.
 - Claude launch options recorded in `herdr.claude-options` through an
   allow-list, and replayed by recovery and waking.
 - Installer builds the stand-in with Bun (ahead-of-time compile, else the
