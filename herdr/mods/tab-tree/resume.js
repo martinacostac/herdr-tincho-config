@@ -59,6 +59,11 @@ export function frontProgram(t) {
 /** @param {Record<string, any> | null | undefined} t */
 export const standinInFront = (t) => frontProgram(t)?.name === STANDIN_APP || t?.foreground?.name === STANDIN_APP;
 
+// The stand-in, or herdr-shell (which starts it), runs in front: what holds a
+// suspended agent's terminal while the suspension label is set.
+/** @param {Record<string, any> | null | undefined} t */
+export const holderInFront = (t) => standinInFront(t) || frontProgram(t)?.name === HERDR_SHELL;
+
 // The stand-in's own report (terminals() keeps it in report, hc get in
 // status), in any state.
 /** @param {Record<string, any> | null | undefined} t */

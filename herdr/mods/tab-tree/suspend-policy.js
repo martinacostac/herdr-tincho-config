@@ -8,7 +8,7 @@
 import { settings, focused, panes, terminals, shared, setShared, readTextFile, exec, hc } from "herdr";
 import { SESSION, PI_RECOVERY, SUSPENDED, STANDIN_APP, piRecovery, suspension } from "./recipes.js";
 import { isClaude } from "./claude-polling.js";
-import { frontProgram, standinInFront, HERDR_SHELL, piSessionHeld, claudeTranscript } from "./resume.js";
+import { frontProgram, holderInFront, piSessionHeld, claudeTranscript } from "./resume.js";
 
 export const NEVER_SUSPEND = "herdr.never-suspend";
 
@@ -31,24 +31,26 @@ function agentOf(t) {
   return /^pi$/i.test(key ?? "") ? "pi" : null;
 }
 
-// Its session, so a wake continues the same conversation (never a picker).
-/** @type {Record<"claude" | "pi", (labels: Record<string, string>) => boolean>} */
-const RESUMABLE = {
-  claude: (labels) => printable(labels[SESSION]),
-  // An ID-only record (no session file) is refused by the stand-in's wake,
-  // so suspending it would only leave a blocked stand-in.
-  pi: (labels) => Boolean(piRecovery(labels[PI_RECOVERY])?.sessionFile),
-};
-
-// And that session on disk, read with a process: Claude's transcript (a
-// Claude that never got a prompt names a session without one), or a Pi
-// session file that holds the recorded session (Pi may write it only after
-// the first message). Without it the wake could not continue the
+// What makes each agent resumable, so a wake continues the same conversation
+// (never a picker). labeled: its session in the terminal's labels. onDisk:
+// that session on disk, read with a process (a slow rule): Claude's
+// transcript (a Claude that never got a prompt names a session without one),
+// or a Pi session file that holds the recorded session (Pi may write it only
+// after the first message). Without it the wake could not continue the
 // conversation, and its messages would be lost or blocked.
-/** @type {Record<"claude" | "pi", (labels: Record<string, string>) => Promise<boolean>>} */
-const SESSION_ON_DISK = {
-  claude: (labels) => claudeTranscript(labels[SESSION]),
-  pi: (labels) => piSessionHeld(piRecovery(labels[PI_RECOVERY])),
+/** @typedef {(labels: Record<string, string>) => boolean} LabelCheck */
+/** @type {Record<"claude" | "pi", { labeled: LabelCheck, onDisk: (labels: Record<string, string>) => Promise<boolean> }>} */
+const RESUMABLE = {
+  claude: {
+    labeled: (labels) => printable(labels[SESSION]),
+    onDisk: (labels) => claudeTranscript(labels[SESSION]),
+  },
+  pi: {
+    // An ID-only record (no session file) is refused by the stand-in's wake,
+    // so suspending it would only leave a blocked stand-in.
+    labeled: (labels) => Boolean(piRecovery(labels[PI_RECOVERY])?.sessionFile),
+    onDisk: (labels) => piSessionHeld(piRecovery(labels[PI_RECOVERY])),
+  },
 };
 
 // The terminals being looked at in this copy's window: the one with the
@@ -77,6 +79,9 @@ const statusOf = (t) => typeof t?.status === "string" ? t.status : t?.status?.st
 // read, and a descendant process that is not a helper.
 /** @typedef {"off" | "remote" | "suspended" | "not-resumable" | "pinned" | "focused" | "working" | "blocked" | "not-idle" | "recent" | "background" | "processes-unknown"} Reason */
 /** @typedef {{ unused: true, agent: "claude" | "pi" } | { unused: false, reason: Reason }} Verdict */
+// What the suspension signal goes to (the suspension record's root): the
+// agent itself as the terminal's main program, or the shell that hosts it.
+/** @typedef {"agent" | "shell"} Root */
 
 // terminal: from terminals() or hc get (status as a word or as an object;
 // foreground.pid is needed for the process check). focusedAt: the last time
@@ -84,44 +89,23 @@ const statusOf = (t) => typeof t?.status === "string" ? t.status : t?.status?.st
 // restart). manual: "Suspend now", which skips only the threshold and works
 // while automatic suspension is off. focusedTerminals: the terminals in the
 // focused tab of any window (each copy of the mod sees only its own window's
-// focus). quick skips the rules that start a process (the session on disk
-// and the process rule): the verdict then holds except for those.
+// focus). skipSlowRules skips the slow rules, the ones that start a process
+// (the session on disk and the process rule): the verdict then holds except
+// for those. snapshot.table receives the process table the rules read.
 /**
  * @param {Record<string, any>} terminal
- * @param {{ now?: number, focusedAt?: number | null, manual?: boolean, focusedTerminals?: Set<string> | null, quick?: boolean }} [options]
+ * @param {{ now?: number, focusedAt?: number | null, manual?: boolean, focusedTerminals?: Set<string> | null, skipSlowRules?: boolean }} [options]
+ * @param {{ table?: ProcessTable | null }} [snapshot]
  * @returns {Promise<Verdict>}
  */
-export async function unusedAgent(terminal, options) {
-  return (await checkRules(terminal, options)).verdict;
-}
-
-// unusedAgent(), and the process table it read (null when it read none).
-/**
- * @param {Record<string, any>} terminal
- * @param {Parameters<typeof unusedAgent>[1]} [options]
- * @returns {Promise<{ verdict: Verdict, table: ProcessTable | null }>}
- */
-async function checkRules(terminal, options) {
-  /** @type {ProcessTable | null} */
-  let table = null;
-  const verdict = await rules(terminal, options, async () => (table = await processTable()));
-  return { verdict, table };
-}
-
-/**
- * @param {Record<string, any>} terminal
- * @param {Parameters<typeof unusedAgent>[1]} options
- * @param {() => Promise<ProcessTable | null>} readProcesses
- * @returns {Promise<Verdict>}
- */
-async function rules(terminal, { now = Date.now(), focusedAt = null, manual = false, focusedTerminals = null, quick = false } = {}, readProcesses) {
+export async function unusedAgent(terminal, { now = Date.now(), focusedAt = null, manual = false, focusedTerminals = null, skipSlowRules = false } = {}, snapshot = {}) {
   const config = suspendSettings();
   if (!manual && !config.auto) return { unused: false, reason: "off" };
   if (typeof terminal.address !== "string" || remote(terminal.address)) return { unused: false, reason: "remote" };
   const labels = terminal.labels ?? {};
   if (Object.hasOwn(labels, SUSPENDED)) return { unused: false, reason: "suspended" };
   const agent = agentOf(terminal);
-  if (!agent || !RESUMABLE[agent](labels)) return { unused: false, reason: "not-resumable" };
+  if (!agent || !RESUMABLE[agent].labeled(labels)) return { unused: false, reason: "not-resumable" };
   if (labels[NEVER_SUSPEND] === "1") return { unused: false, reason: "pinned" };
   if (focusedHere().has(terminal.address) || focusedTerminals?.has(terminal.address)) return { unused: false, reason: "focused" };
   const status = statusOf(terminal);
@@ -136,9 +120,10 @@ async function rules(terminal, { now = Date.now(), focusedAt = null, manual = fa
     const since = Math.max(terminal.status_ms, Number.isFinite(focusedAt) ? focusedAt : -Infinity);
     if (now - since < config.afterMinutes * MINUTE) return { unused: false, reason: "recent" };
   }
-  if (quick) return { unused: true, agent };
-  if (!await SESSION_ON_DISK[agent](labels)) return { unused: false, reason: "not-resumable" };
-  const allHelpers = onlyHelpers(await readProcesses(), terminal.pid, terminal.foreground?.pid, config.helpers);
+  if (skipSlowRules) return { unused: true, agent };
+  if (!await RESUMABLE[agent].onDisk(labels)) return { unused: false, reason: "not-resumable" };
+  snapshot.table = await processTable();
+  const allHelpers = onlyHelpers(snapshot.table, terminal.pid, terminal.foreground?.pid, config.helpers);
   if (allHelpers === null) return { unused: false, reason: "processes-unknown" };
   if (!allHelpers) return { unused: false, reason: "background" };
   return { unused: true, agent };
@@ -166,6 +151,25 @@ async function processTable() {
   return table;
 }
 
+// Every process under pid in the table, parents before their children.
+/** @param {ProcessTable | null} table @param {number} pid @returns {number[]} */
+function descendants(table, pid) {
+  /** @type {number[]} */
+  const found = [];
+  const seen = new Set([pid]);
+  /** @param {number} parent */
+  const walk = (parent) => {
+    for (const child of table?.children.get(parent) ?? []) {
+      if (seen.has(child.pid)) continue;
+      seen.add(child.pid);
+      found.push(child.pid);
+      walk(child.pid);
+    }
+  };
+  walk(pid);
+  return found;
+}
+
 // Whether every descendant process of the agent (its foreground program) is a
 // helper: its command line, or the command line of an ancestor between it and
 // the agent, contains an entry of the allow-list. So the children of an MCP
@@ -186,7 +190,8 @@ function onlyHelpers(table, mainPid, agentPid, helpers) {
   if (!helpersOnly(agentPid)) return false;
   if (mainPid === agentPid) return true;
   if (!known(mainPid)) return null;
-  // The shell's child on the way to the agent.
+  // The shell's child on the way to the agent. The hop limit ends the walk
+  // on a parent loop (a table read while pids were reused).
   let line = agentPid;
   for (let hops = 0; table.parents.get(line) !== mainPid; hops++) {
     line = table.parents.get(line);
@@ -223,7 +228,7 @@ export function suspendSettings() {
 // - root=agent: SIGKILL. Pi (and maybe Claude) turns SIGTERM and SIGHUP into
 //   exit code 0, which would end the terminal; no program can catch SIGKILL.
 //   Its helpers (MCP servers) then get SIGTERM, so they don't outlive it.
-/** @type {Record<"agent" | "shell", string>} */
+/** @type {Record<Root, string>} */
 const SIGNAL = { agent: "KILL", shell: "TERM" };
 
 /** @param {string} address @returns {Promise<Record<string, any> | null>} */
@@ -295,8 +300,7 @@ function staleLabel(t, now) {
   if (typeof t?.address !== "string" || remote(t.address) || t.state !== "live") return false;
   const labels = t.labels ?? {};
   if (!Object.hasOwn(labels, SUSPENDED)) return false;
-  const front = frontProgram(t);
-  if (!front || standinInFront(t) || front.name === HERDR_SHELL) return false;
+  if (!frontProgram(t) || holderInFront(t)) return false;
   const since = suspension(labels[SUSPENDED])?.since;
   return !(Number.isFinite(since) && now - since < REPAIR_MS);
 }
@@ -372,10 +376,10 @@ export const SUSPEND_REQUESTS = "tincho.suspend.requests";
 export const SUSPEND_STATE = "tincho.suspend.state";
 const REQUEST_MS = 60_000;
 const RESULT_MS = 10 * 60_000;
-// After a rule that starts a process refused an agent (background processes,
+// After a slow rule refused an agent (background processes,
 // or no session on disk), the pass checks it again only after this long.
 const RECHECK_MS = 5 * 60_000;
-// Those rules' reasons. A "not-resumable" from a suspension comes from the
+// The slow rules' reasons (they start a process, see unusedAgent()). A "not-resumable" from a suspension comes from the
 // session on disk: the pass already checked the session label.
 /** @type {Set<Outcome | null>} */
 const SLOW_RULES = new Set(["background", "processes-unknown", "not-resumable"]);
@@ -686,16 +690,20 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
     const before = await coreTerminal(address);
     if (closed) return abort("closed");
     if (before?.state !== "live") return abort("gone");
-    const { verdict, table } = await checkRules(before, { now, manual, ...rulesInput(focusView(now), address) });
+    /** @type {{ table?: ProcessTable | null }} */
+    const snapshot = {};
+    const verdict = await unusedAgent(before, { now, manual, ...rulesInput(focusView(now), address) }, snapshot);
     if (closed) return abort("closed");
     if ("reason" in verdict) return abort(verdict.reason);
     const pid = before.pid;
     if (!Number.isSafeInteger(pid) || pid <= 0) return abort("processes-unknown");
     // A shell hosts the agent when the main program is not the agent itself.
+    /** @type {Root} */
     const root = pid === before.foreground?.pid ? "agent" : "shell";
-    // The agent's helpers, from the process snapshot of step 1 (every child of
-    // the agent is a helper, or step 1 refused it).
-    const helpers = root === "agent" ? (table?.children.get(pid) ?? []).map((child) => String(child.pid)) : [];
+    // The agent's helpers, every process under it in the process snapshot of
+    // step 1 (each child of the agent is a helper, or step 1 refused it): a
+    // wrapper (uvx, npx) may not pass SIGTERM on to the server it started.
+    const helpers = root === "agent" ? descendants(snapshot.table, pid).map(String) : [];
     const label = suspension(JSON.stringify({ version: 1, agent: verdict.agent, root, cwd: before.foreground?.cwd, since: now }));
     if (!label) return abort("not-resumable");
     // 2. Keep the terminal, so the signal leaves it live.
@@ -733,7 +741,8 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
   // Every 15 s: the heartbeat, then the leader shares each local agent's
   // reasons and suspends the unused agents one at a time. Without an agent
   // past its threshold it starts no process: the installation is checked
-  // only then, so "not-installed" shows in the reasons from that check on.
+  // only then, at most every INSTALL_CHECK_MS (a suspension also checks it),
+  // so "not-installed" shows in the reasons from that check on.
   /** @param {number} [now] */
   async function pass(now = clock()) {
     if (closed) return;
@@ -750,7 +759,7 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
       for (const terminal of terminals()) {
         if (!localAgent(terminal)) continue;
         const address = terminal.address;
-        const input = { now, quick: true, ...rulesInput(view, address) };
+        const input = { now, skipSlowRules: true, ...rulesInput(view, address) };
         /** @type {Outcome | null} */
         let manual = reasonOf(await unusedAgent(terminal, { ...input, manual: true }));
         /** @type {Outcome | null} */

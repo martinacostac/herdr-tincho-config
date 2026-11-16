@@ -162,9 +162,10 @@ test("a suspension checks, keeps, checks again, labels and signals, in that orde
 // treats as final: the terminal would end. SIGKILL cannot become an exit code.
 test("an agent that is the terminal's main program gets SIGKILL, then its helpers from the process snapshot get SIGTERM", async () => {
   reset();
+  // Every process of a helper: a wrapper (uvx) may not pass SIGTERM on.
   processRows.push([102, 100, "uvx some-mcp-server"], [103, 102, "python -m server"]);
   assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: true });
-  assert.deepEqual(actions().filter(([command]) => command === "kill"), [["kill", "-KILL", "100"], ["kill", "-TERM", "101", "102"]]);
+  assert.deepEqual(actions().filter(([command]) => command === "kill"), [["kill", "-KILL", "100"], ["kill", "-TERM", "101", "102", "103"]]);
   // Claude as the main program takes the same path; without helpers, only SIGKILL.
   reset();
   core.t8 = [claudeCore({ pid: 201, argv: ["claude"] })];

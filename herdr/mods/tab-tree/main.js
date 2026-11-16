@@ -18,7 +18,7 @@
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, panes, terminals, machines, run, openOverlay, theme, shared, setShared, exec, hc, home, layout } from "herdr";
-import { LABEL, RECIPES, WAKE_MS, HERDR_SHELL, createRecovery, remember, claudeLaunch, rememberClaudeLaunch, waking, frontProgram, standinInFront } from "./resume.js";
+import { LABEL, RECIPES, WAKE_MS, createRecovery, remember, claudeLaunch, rememberClaudeLaunch, waking, frontProgram, holderInFront } from "./resume.js";
 import { claudeCandidate, processIdentity } from "./claude-polling.js";
 import { SUSPENDED, STANDIN_APP, suspension } from "./recipes.js";
 import { createSuspender } from "./suspend-policy.js";
@@ -51,6 +51,10 @@ function icon(p, size, color) {
   if (!p?.icon) return null;
   return p.tint ? svg(p.icon).size(size).flex_none().text_color(color) : image(p.icon).w(size).h(size).flex_none();
 }
+
+// Whether a terminal's labels carry the suspension label.
+/** @param {Record<string, string> | undefined} labels */
+const labeledSuspended = (labels) => Object.hasOwn(labels ?? {}, SUSPENDED);
 
 const same = (a, b) => (a ?? "").toLowerCase() === (b ?? "").toLowerCase();
 const base = (path) => (path ?? "").replace(/\/+$/, "").split("/").pop() || "/";
@@ -228,7 +232,7 @@ export default class TabTree extends View {
     for (const p of panes()) {
       const agent = p.program?.agent && p.program.key;
       if (!agent || !p.terminal || p.terminal.includes("/") || !labels.has(p.terminal)) continue;
-      if (p.app === STANDIN_APP || Object.hasOwn(labels.get(p.terminal), SUSPENDED)) continue;
+      if (p.app === STANDIN_APP || labeledSuspended(labels.get(p.terminal))) continue;
       const key = `${p.terminal}=${agent}`;
       if (labels.get(p.terminal)[LABEL] === agent || this.labeling.has(key)) continue;
       this.labeling.add(key);
@@ -296,12 +300,12 @@ export default class TabTree extends View {
     if (p.app === STANDIN_APP && p.status === "working") return "waking";
     if (!this.suspensionLabel(p.terminal)) return null;
     const core = this.cores?.get(p.terminal);
-    return standinInFront(core) || frontProgram(core)?.name === HERDR_SHELL ? "suspended" : null;
+    return holderInFront(core) ? "suspended" : null;
   }
 
   /** @param {string} address */
   suspensionLabel(address) {
-    return Object.hasOwn(this.labels.get(address) ?? {}, SUSPENDED);
+    return labeledSuspended(this.labels.get(address));
   }
 
   now() {
