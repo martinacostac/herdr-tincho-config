@@ -97,16 +97,21 @@ install_tree() (
     from="$src/$rel" to="$app/$rel"
     [ -f "$from" ] || continue
     want=$(sha "$from")
+    # Renamed or deleted since the check (an editor saving by rename while
+    # --watch runs): skip it; the next pass sees the new file.
+    [ -n "$want" ] || continue
     have=""
     [ -f "$to" ] && have=$(sha "$to")
     was=$(last "$rel")
     if [ "$have" = "$want" ]; then
       :
     elif [ -z "$have" ] || [ "$have" = "$was" ]; then
-      put "$from" "$to"; echo "installed  $rel"; changed=$((changed + 1))
+      put "$from" "$to" || continue
+      echo "installed  $rel"; changed=$((changed + 1))
     elif $force; then
       cp "$to" "$to.orig"
-      put "$from" "$to"; echo "overwrote  $rel (previous copy: $rel.orig)"; changed=$((changed + 1))
+      put "$from" "$to" || continue
+      echo "overwrote  $rel (previous copy: $rel.orig)"; changed=$((changed + 1))
     else
       echo "skipped    $rel: changed on this machine since the last install"
       echo "           compare: diff -u '$to' '$from'   (--force overwrites, keeping a .orig copy)"

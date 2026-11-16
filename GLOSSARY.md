@@ -9,6 +9,13 @@ names the concepts the mods work with.
 A persistent hc terminal with a stable address (`t7` or a name), labels, and parent/child links. It outlives the program running in it when kept.
 _Avoid_: Pane, tab (those are window concepts that show a terminal)
 
+**Main program**:
+The program hc started in a terminal: either an agent itself, or a shell hosting one. A normal exit of the main program ends the terminal; a loss by signal in a kept terminal does not.
+_Avoid_: Root process, root program
+
+**Hosting shell**:
+A shell that is a terminal's main program and runs an agent in front of it.
+
 **Agent**:
 A coding-agent program (Claude, Pi) running in a terminal and reporting its status to Herdr.
 
