@@ -17,13 +17,29 @@ The process replacement and the terminal I/O stay behind a thin boundary that te
 
 **Blocked by:** 01 (facts F2 and F5), 02 (shared recipe module)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] bun tests cover bracketed paste, typed lines, an empty Enter, and pastes that contain newlines or escape sequences
-- [ ] bun tests cover the 500 ms batching window and the joined messages
-- [ ] bun tests cover the status report emitted in each state
-- [ ] bun tests cover the wake command for each root, including `--` and the messages, and label removal before the replacement
-- [ ] bun tests cover the stale-label handover to `$SHELL`
-- [ ] bun tests cover the missing-session path: file written, path shown, `blocked` reported, no wake
-- [ ] The stand-in uses the shared recipe module and the shared Pi session check, not copies
-- [ ] The ahead-of-time build runs by hand and the measured footprint is 10 MB or less
+- [x] bun tests cover bracketed paste, typed lines, an empty Enter, and pastes that contain newlines or escape sequences
+- [x] bun tests cover the 500 ms batching window and the joined messages
+- [x] bun tests cover the status report emitted in each state
+- [x] bun tests cover the wake command for each root, including `--` and the messages, and label removal before the replacement
+- [x] bun tests cover the stale-label handover to `$SHELL`
+- [x] bun tests cover the missing-session path: file written, path shown, `blocked` reported, no wake
+- [x] The stand-in uses the shared recipe module and the shared Pi session check, not copies
+- [x] The ahead-of-time build runs by hand and the measured footprint is 10 MB or less
+
+## Comments
+
+Done in 547b381 (stand-in) and 2385d12 (review fixes).
+
+- Sources: `suspend/standin.ts` (logic), `suspend/input.ts` (paste and key parser), `suspend/system.ts` (the real boundary: terminal, hc, files, clock), `suspend/libc.ts` (execvp through bun:ffi, libc.dylib or libc.so.6), `suspend/main.ts` (entry), `suspend/build.sh` (build by hand). Tests: `tests/standin.test.ts` (bun test, 27 pass).
+- Uses `recipe`, `suspension`, `piRecovery` and `holdsPiSession` from `herdr/mods/tab-tree/recipes.js`, so Claude's launch options (ticket 03) come along without code of their own.
+- Build: `sh suspend/build.sh <out>` runs `bun compile --trim-locales en --no-compile-function-source`, or `bun build --compile --minify` when `bun compile` is missing. Measured footprint of an idle stand-in with `footprint <pid>` on macOS (Bun 1.4.5 canary): about 7.5 MB for the small compile, and 7.6 to 8.5 MB for the standard compile.
+- Checked end to end in throwaway hc terminals with a fake `claude` on PATH: `hc send --if idle` to the stand-in wakes it in place (same pid). The message arrives after `--`, with its newlines. The label is removed, and the recorded folder and options are used. With `root=shell`, a zsh prompt follows. A missing Pi session file writes the messages to the undelivered folder and reports `blocked`, and the stale-label handover starts `$SHELL`.
+- Beyond the ticket, all for safety:
+  - Before exec, signals that Bun ignores (SIGPIPE) are reset to their default. Ignored signals survive exec, and without the reset the shell after the agent would ignore SIGPIPE.
+  - A failed chdir, label removal or exec takes the missing-session path (messages saved, `blocked`). A failed exec also puts the label back.
+  - When hc cannot read the terminal, or the record is unreadable, the stand-in reports `blocked` on start and never starts a shell.
+  - An empty wake that cannot happen reports `blocked` only once.
+- A Pi record without `sessionFile` counts as a missing session, because the stand-in cannot verify it. The Pi extension always records a file.
+- Open: the restored last screen needs `restore_screen = true` in herdr-core's config. No ticket sets it today. The stand-in prints its line below whatever hc shows.
