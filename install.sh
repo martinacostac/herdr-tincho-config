@@ -8,11 +8,15 @@
 # With Bun on PATH, it also builds the suspended agents' stand-in
 # (suspend/build.sh) and installs it with its launcher, herdr-shell, into
 # $XDG_DATA_HOME/herdr-tincho-config/bin (else ~/.local/share/...), which
-# is not on PATH. Without Bun that part is skipped.
+# is not on PATH. Then it points herdr-core's `shell` setting at that
+# herdr-shell, in $XDG_CONFIG_HOME/herdr-core/config.toml (else ~/.config/...), and
+# changes no other key. A different `shell` value is reported and kept.
+# Without Bun that part is skipped, and the `shell` key is left unchanged.
 #
 #   ./install.sh            install what changed
 #   ./install.sh --watch    and again on every save (polls once a second)
-#   ./install.sh --force    also overwrite files edited in place (keeps a .orig copy)
+#   ./install.sh --force    also overwrite files edited in place, and a different
+#                           `shell` value (keeps a .orig copy)
 #
 # It remembers what it installed (sha256 per file, in
 # $XDG_STATE_HOME/herdr-tincho-config/installed, or installed-pi for Pi).
@@ -27,6 +31,7 @@ app="${HERDR_APP_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr-app}"
 pi="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
 state="${XDG_STATE_HOME:-$HOME/.local/state}/herdr-tincho-config"
 bin="${XDG_DATA_HOME:-$HOME/.local/share}/herdr-tincho-config/bin"
+core="${XDG_CONFIG_HOME:-$HOME/.config}/herdr-core/config.toml"
 
 force=false
 watch=false
@@ -196,7 +201,128 @@ install_suspend() (
   echo "$want herdr-shell" >> "$next"
   if cmp -s "$next" "$manifest"; then rm -f "$next"; else mv -f "$next" "$manifest"; fi
   echo "suspend: $changed installed -> $bin"
+  shell_key
 )
+
+# An awk program for herdr-core's config (TOML). It finds the top-level
+# `shell` key (before the first table header), also when its list spans
+# lines. With mode=check it prints "absent", "same" (the value is a list of
+# only the path in ENVIRON["path"], ENVIRON["esc"] in a basic string), or "other" and the key's lines. With
+# mode=write it prints the file with that key set to ENVIRON["line"]: in
+# place of the old key, or else after the last top-level line (before the
+# comments and blank lines over the first table header). Every other line is
+# printed as it is.
+toml_shell='
+# s without spaces and comments outside strings; counts brackets in depth.
+function strip(s,   out, i, c, q) {
+  out = ""; q = ""
+  for (i = 1; i <= length(s); i++) {
+    c = substr(s, i, 1)
+    if (q != "") {
+      out = out c
+      if (q == "\"" && c == "\\") { i++; out = out substr(s, i, 1) }
+      else if (c == q) q = ""
+      continue
+    }
+    if (c == "#") break
+    if (c == " " || c == "\t" || c == "\r") continue
+    if (c == "\"" || c == "\047") q = c
+    if (c == "[") depth++
+    if (c == "]") depth--
+    out = out c
+  }
+  return out
+}
+{ line[NR] = $0 }
+table { next }
+depth > 0 {
+  s = strip($0)
+  if (inshell) { value = value s; if (depth <= 0) { inshell = 0; last = NR } }
+  next
+}
+/^[ \t]*\[/ { table = NR; next }
+!first && /^[ \t]*(shell|"shell"|\047shell\047)[ \t]*=/ {
+  first = last = NR; rest = $0; sub(/^[^=]*=/, "", rest)
+  value = strip(rest); if (depth > 0) inshell = 1
+  next
+}
+{ rest = $0; sub(/^[^=]*=/, "", rest); strip(rest) }
+END {
+  path = ENVIRON["path"]; esc = ENVIRON["esc"]
+  if (mode == "check") {
+    if (!first) { print "absent"; exit }
+    if (value == "[\"" esc "\"]" || value == "[\"" esc "\",]" ||
+        (index(path, "\047") == 0 && (value == "[\047" path "\047]" || value == "[\047" path "\047,]"))) {
+      print "same"; exit
+    }
+    print "other"
+    for (i = first; i <= last; i++) print line[i]
+    exit
+  }
+  at = NR + 1
+  if (first) at = first
+  else if (table) {
+    at = table
+    while (at > 1 && line[at - 1] ~ /^[ \t\r]*(#.*)?$/) at--
+  }
+  for (i = 1; i <= NR + 1; i++) {
+    if (i == at) print ENVIRON["line"]
+    if (first && i >= first && i <= last) continue
+    if (i <= NR) print line[i]
+  }
+}'
+
+# Points herdr-core's `shell` setting at the installed herdr-shell, by its
+# absolute path (hc runs the path as written). Only that key changes. A
+# missing file is created with only that key, an identical value is left
+# alone (nothing is written, so --watch does not rewrite it on every pass),
+# and a different value is reported and kept, or with --force replaced
+# after a copy of the file is kept as config.toml.orig.
+shell_key() {
+  if [ ! -x "$bin/herdr-shell" ] || [ ! -x "$bin/herdr-standin" ]; then
+    echo "suspend: shell setting unchanged (herdr-standin is not installed)"
+    return 0
+  fi
+  path=$(cd "$bin" && pwd)/herdr-shell
+  # TOML strings cannot hold control characters as they are.
+  if [ "$(printf '%s' "$path" | LC_ALL=C tr -d '[:cntrl:]')" != "$path" ]; then
+    echo "suspend: shell setting unchanged (control characters in $path)"
+    return 0
+  fi
+  esc=$(printf '%s\n' "$path" | sed 's/[\\"]/\\&/g')
+  line="shell = [\"$esc\"]"
+  if [ -f "$core" ]; then
+    found=$(path=$path esc=$esc awk -v mode=check "$toml_shell" "$core")
+  else
+    found=missing
+  fi
+  case $found in
+    same) return 0 ;;
+    other*)
+      if ! $force; then
+        echo "skipped    shell in $core: herdr-shell needs $line, the file has:"
+        printf '%s\n' "$found" | sed '1d; s/^/             /'
+        echo '           (--force replaces it, keeping a .orig copy)'
+        return 0
+      fi
+      cp "$core" "$core.orig" ;;
+  esac
+  mkdir -p "$(dirname "$core")"
+  tmp="$core.install-tmp"
+  if [ -f "$core" ]; then
+    # cp first, so the new file keeps the old one's mode.
+    cp "$core" "$tmp"
+    path=$path line=$line awk -v mode=write "$toml_shell" "$core" > "$tmp"
+  else
+    printf '%s\n' "$line" > "$tmp"
+  fi
+  # A linked config (a dotfiles repo) is written through the link.
+  if [ -L "$core" ]; then cat "$tmp" > "$core"; rm -f "$tmp"; else mv -f "$tmp" "$core"; fi
+  case $found in
+    other*) echo "overwrote  shell in $core (previous copy: $core.orig)" ;;
+    *) echo "set        $line in $core" ;;
+  esac
+}
 
 install() {
   install_tree herdr "$app" "$state/installed"

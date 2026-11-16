@@ -19,7 +19,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 assert_file() { [ -f "$1" ] || fail "missing $1"; }
 assert_absent() { [ ! -e "$1" ] || fail "unexpected $1"; }
 assert_same() { cmp -s "$1" "$2" || fail "$1 differs from $2"; }
-assert_log() { grep -F "$1" "$log" >/dev/null || fail "missing log: $1"; }
+assert_log() { grep -F -e "$1" "$log" >/dev/null || fail "missing log: $1"; }
 # The caller's PATH without folders that hold a bun, so a real Bun never
 # builds anything here. Tests that need Bun put a fake one first.
 nobun_path=$(printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r dir; do
@@ -45,6 +45,7 @@ fixture() {
   run_path=$nobun_path
   app="$home/.config/herdr-app"
   bin="$home/.local/share/herdr-tincho-config/bin"
+  core="$home/.config/herdr-core/config.toml"
   pi="$home/.pi/agent"
   record="$state/herdr-tincho-config"
   log="$case_dir/output"
@@ -368,6 +369,122 @@ run > "$log"
 [ "$(build_count)" = 1 ] || fail 'the next run did not retry the failed build'
 echo 'ok - a failed build keeps the installed stand-in and is retried on the next run'
 
+fixture shell-key-missing
+suspend_sources
+fake_bun aot
+run > "$log"
+printf 'shell = ["%s/herdr-shell"]\n' "$bin" > "$case_dir/expected"
+assert_same "$case_dir/expected" "$core"
+echo 'ok - a missing herdr-core config is created with only the shell key'
+
+fixture shell-key-other-keys
+suspend_sources
+fake_bun aot
+mkdir -p "$(dirname "$core")"
+# Today's real file: a comment and one key. The new key goes after it.
+printf '# Show a lost kept program'"'"'s last screen above the recovery shell.\nrestore_screen = true\n' > "$core"
+chmod 600 "$core"
+run > "$log"
+{
+  printf '# Show a lost kept program'"'"'s last screen above the recovery shell.\nrestore_screen = true\n'
+  printf 'shell = ["%s/herdr-shell"]\n' "$bin"
+} > "$case_dir/expected"
+assert_same "$case_dir/expected" "$core"
+[ "$(ls -l "$core" | cut -c1-10)" = '-rw-------' ] || fail 'the config lost its mode'
+[ -z "$(find "$(dirname "$core")" -name '*.install-tmp' -print)" ] || fail 'staging files remain'
+# Tables: the key goes at the top level, before the comments over the first
+# table; a list over several lines that holds a nested list is not a table.
+cat > "$core" <<'EOF'
+notes = false   # a comment
+heartbeat = [
+  [1, "]"],
+]
+
+# The machines.
+[machine.box]
+shell = "not the top-level key"
+EOF
+run > "$log"
+{
+  printf 'notes = false   # a comment\nheartbeat = [\n  [1, "]"],\n]\n'
+  printf 'shell = ["%s/herdr-shell"]\n' "$bin"
+  printf '\n# The machines.\n[machine.box]\nshell = "not the top-level key"\n'
+} > "$case_dir/expected"
+assert_same "$case_dir/expected" "$core"
+assert_absent "$core.orig"
+echo 'ok - an existing herdr-core config keeps its other keys, comments and mode'
+
+# The inode changes when a file is written by a rename.
+inode() { ls -i "$1" | awk '{ print $1 }'; }
+fixture shell-key-same
+suspend_sources
+fake_bun aot
+mkdir -p "$(dirname "$core")"
+# The same value with other spacing, a trailing comma and a comment.
+printf 'restore_screen = true\nshell = [ "%s/herdr-shell", ]  # mine\n' "$bin" > "$core"
+cp "$core" "$case_dir/before"
+before=$(inode "$core")
+run > "$log"
+assert_same "$case_dir/before" "$core"
+[ "$(inode "$core")" = "$before" ] || fail 'an identical shell value was written again'
+assert_absent "$core.orig"
+if grep -E '^(set|skipped|overwrote) +shell' "$log" >/dev/null; then fail "reported an identical shell value: $(cat "$log")"; fi
+echo 'ok - an identical shell value is left alone'
+
+fixture shell-key-conflict
+suspend_sources
+fake_bun aot
+mkdir -p "$(dirname "$core")"
+printf '# mine\nshell = [\n  "fish",\n  "-l",\n]\nrestore_screen = true\n' > "$core"
+cp "$core" "$case_dir/before"
+before=$(inode "$core")
+run > "$log"
+assert_same "$case_dir/before" "$core"
+[ "$(inode "$core")" = "$before" ] || fail 'a conflicting shell value was written'
+assert_absent "$core.orig"
+assert_log "skipped    shell in $core"
+assert_log '"fish",'
+assert_log '--force'
+run --force > "$log"
+assert_same "$case_dir/before" "$core.orig"
+{
+  printf '# mine\n'
+  printf 'shell = ["%s/herdr-shell"]\n' "$bin"
+  printf 'restore_screen = true\n'
+} > "$case_dir/expected"
+assert_same "$case_dir/expected" "$core"
+assert_log "overwrote  shell in $core"
+# Now identical: a second --force changes nothing and keeps the .orig copy.
+cp "$core" "$case_dir/after"
+run --force > "$log"
+assert_same "$case_dir/after" "$core"
+assert_same "$case_dir/before" "$core.orig"
+echo 'ok - a conflicting shell value is reported and kept; --force replaces it with a .orig copy'
+
+fixture shell-key-no-bun
+suspend_sources
+run --force > "$log"
+assert_log 'suspend: skipped (no bun)'
+assert_absent "$home/.config/herdr-core"
+mkdir -p "$(dirname "$core")"
+printf 'shell = ["fish"]\n' > "$core"
+cp "$core" "$case_dir/before"
+run --force > "$log"
+assert_same "$case_dir/before" "$core"
+assert_absent "$core.orig"
+echo 'ok - without bun the shell key is left unchanged, even with --force'
+
+fixture shell-key-xdg
+suspend_sources
+fake_bun aot
+config="$case_dir/xdg config"
+app="$config/herdr-app"
+run > "$log"
+printf 'shell = ["%s/herdr-shell"]\n' "$bin" > "$case_dir/expected"
+assert_same "$case_dir/expected" "$config/herdr-core/config.toml"
+assert_absent "$core"
+echo 'ok - the herdr-core config follows XDG_CONFIG_HOME'
+
 wait_same() {
   attempts=0
   until cmp -s "$1" "$2"; do
@@ -452,6 +569,8 @@ fake_bun aot
   sh "$repo/install.sh" --watch > "$log" 2>&1) &
 watch_pid=$!
 wait_log 'suspend: 2 installed'
+wait_log 'set        shell'
+before=$(inode "$core")
 # Idle: the new binary and the manifest are not sources, so nothing rebuilds.
 sleep 2.5
 [ "$(build_count)" = 1 ] || fail "idle watch rebuilt the stand-in ($(build_count) builds)"
@@ -461,6 +580,7 @@ printf '# edited\n' >> "$repo/suspend/herdr-shell"
 wait_same "$repo/suspend/herdr-shell" "$bin/herdr-shell"
 sleep 1.5
 [ "$(build_count)" = 2 ] || fail "watch rebuilt the stand-in after a launcher edit ($(build_count) builds)"
+[ "$(inode "$core")" = "$before" ] || fail 'watch wrote the shell key again'
 kill "$watch_pid"
 wait "$watch_pid" 2>/dev/null || :
 watch_pid=
