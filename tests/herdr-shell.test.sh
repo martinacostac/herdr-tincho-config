@@ -39,6 +39,7 @@ hc_calls() { if [ -f "$case/hc.log" ]; then wc -l < "$case/hc.log" | tr -d ' '; 
 terminal_json() {
   printf '{"address":"t7","argv":["fish","-l"],"cols":80,"cwd":"/w","foreground":{"argv":["fish"],"cwd":"/w","name":"fish","pid":11},"keep":true,"labels":%s,"name":%s,"pid":11,"state":"live","status":null,"turn":3}\n' "$1" "$2"
 }
+unavailable_json='{"error":{"hint":"run the command again; terminals kept running","kind":"unavailable","message":"the core restarted while this ran (an update?)"}}'
 suspended_label='"herdr.suspended":"{\"version\":1,\"agent\":\"pi\",\"root\":\"shell\",\"cwd\":\"/w\",\"since\":1794803331582}"'
 
 # answer [n] rc: the fake hc's answer to call n (default: every call). The JSON
@@ -81,9 +82,13 @@ EOF
   base_path="PATH=$case/path:/usr/bin:/bin"
 }
 
-# launch [VAR=value...] -- [launcher arguments...]: run the launcher in the
-# foreground with a clean environment, stdin closed.
-launch() {
+# start fg|bg [VAR=value...] -- [launcher arguments...]: run the launcher
+# with a clean environment. fg: stdin closed; it must exit 0 within 5 s (the
+# program it started exited 0). bg: in the background, with stdin from a
+# fifo that the test writes to on fd 4.
+start() {
+  mode=$1
+  shift
   # Replace the first -- with the interpreter and the launcher's path.
   seen=
   for word do
@@ -95,28 +100,24 @@ launch() {
       set -- "$@" "$word"
     fi
   done
-  env -i "$base_path" "CASE=$case" "$@" < /dev/null > "$case/out" 2>&1 ||
-    fail "the launcher exited with code $?"
+  if [ "$mode" = fg ]; then
+    env -i "$base_path" "CASE=$case" "$@" < /dev/null > "$case/out" 2>&1 &
+    bg_pid=$!
+    # A launcher that waits instead of starting a program would never exit.
+    i=0
+    while kill -0 "$bg_pid" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    kill -0 "$bg_pid" 2>/dev/null && fail 'the launcher is still running after 5 s'
+    wait "$bg_pid" || fail "the launcher exited with code $?"
+    bg_pid=
+  else
+    mkfifo "$case/stdin"
+    env -i "$base_path" "CASE=$case" "$@" < "$case/stdin" > "$case/out" 2>&1 &
+    bg_pid=$!
+    exec 4> "$case/stdin"
+  fi
 }
-
-# launch_waiting [VAR=value...] -- [arguments...]: like launch, but in the
-# background, with stdin from a fifo that the test writes to on fd 4.
-launch_waiting() {
-  seen=
-  for word do
-    shift
-    if [ -z "$seen" ] && [ "$word" = -- ]; then
-      seen=1
-      set -- "$@" "$interp" "$launcher"
-    else
-      set -- "$@" "$word"
-    fi
-  done
-  mkfifo "$case/stdin"
-  env -i "$base_path" "CASE=$case" "$@" < "$case/stdin" > "$case/out" 2>&1 &
-  bg_pid=$!
-  exec 4> "$case/stdin"
-}
+launch() { start fg "$@"; }
+launch_waiting() { start bg "$@"; }
 # Stops the background launcher; it must still be waiting.
 stop_waiting() {
   kill -0 "$bg_pid" 2>/dev/null || fail 'the launcher exited instead of waiting'
@@ -175,11 +176,31 @@ run_cases() {
     terminal_json '{}' '"impl"' | answer 0
     launch HC_TERMINAL_ID=t7 -- -c 'printf "%s\n" bin-sh "$0" "$@" > "$CASE/ran"' zero "a b"
     assert_ran bin-sh zero "a b"
+  else
+    echo "skipped [$interp] shell-unset-falls-back-to-bin-sh: this sh sets SHELL itself"
   fi
 
+  new_case broken-shell-waits
+  terminal_json '{}' '"impl"' | answer 0
+  launch_waiting HC_TERMINAL_ID=t7 "SHELL=$case/no-such-shell" --
+  wait_prompt
+  assert_out "the shell $case/no-such-shell cannot be started"
+  assert_nothing_ran
+  stop_waiting
+
+  new_case spaced-json-label-starts-standin
+  printf '%s\n' '{ "address" : "t7",' '  "labels" : { "herdr.suspended" : "{\"version\": 1, \"agent\": \"claude\"}" },' '  "name" : "impl" }' | answer 0
+  launch HC_TERMINAL_ID=t7 "SHELL=$fake_shell" --
+  assert_ran standin claude t7 impl
+
+  new_case warning-before-answer-starts-standin
+  { echo 'warning: a newer hc [0.2] is available'; terminal_json "{$suspended_label}" '"impl"'; } | answer 0
+  launch HC_TERMINAL_ID=t7 "SHELL=$fake_shell" --
+  assert_ran standin pi t7 impl
+
   new_case unavailable-core-is-retried
-  printf '%s\n' '{"error":{"kind":"unavailable","message":"the core restarted while this ran (an update?)"}}' | answer 1 5
-  printf '%s\n' '{"error":{"kind":"unavailable","message":"the core restarted while this ran (an update?)"}}' | answer 2 5
+  printf '%s\n' "$unavailable_json" | answer 1 5
+  printf '%s\n' "$unavailable_json" | answer 2 5
   terminal_json "{$suspended_label}" '"impl"' | answer 0
   launch HC_TERMINAL_ID=t7 "SHELL=$fake_shell" --
   assert_ran standin pi t7 impl
@@ -187,7 +208,7 @@ run_cases() {
   if grep -F unavailable "$case/out" >/dev/null; then fail 'a retried error was shown'; fi
 
   new_case core-never-answers-waits-without-shell
-  printf '%s\n' '{"error":{"kind":"unavailable","message":"the core restarted while this ran"}}' | answer 5
+  printf '%s\n' "$unavailable_json" | answer 5
   launch_waiting HC_TERMINAL_ID=t7 "SHELL=$fake_shell" --
   wait_prompt
   assert_out 'herdr-shell: hc get t7 failed (exit 5)'
@@ -258,12 +279,23 @@ for interp in $interps; do
   run_cases
 done
 
-# hc starts the configured shell by its path, through the #! line.
-interp=direct
+# hc starts the configured shell by its path, through the #! line. (env, as
+# the interpreter, runs the launcher's path directly.)
+interp=env
 new_case executable-finds-standin-next-to-itself
 terminal_json "{$suspended_label}" '"impl"' | answer 0
 [ -x "$launcher" ] || fail 'the launcher is not executable'
-env -i "$base_path" "CASE=$case" HC_TERMINAL_ID=t7 "$launcher" -l \
-  < /dev/null > "$case/out" 2>&1
+launch HC_TERMINAL_ID=t7 -- -l
 assert_ran standin pi t7 impl
+
+# Started by its bare name from its own folder ($0 has no slash).
+interp=sh
+new_case bare-name-finds-standin-in-its-folder
+terminal_json "{$suspended_label}" '"impl"' | answer 0
+cd "$bin"
+launcher=herdr-shell
+launch HC_TERMINAL_ID=t7 --
+cd "$project"
+assert_ran standin pi t7 impl
+
 echo "herdr-shell tests passed ($interps)"

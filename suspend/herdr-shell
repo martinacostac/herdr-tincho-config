@@ -1,18 +1,28 @@
 #!/bin/sh
-# herdr-shell: hc's configured `shell`, so every new terminal and every keep
-# recovery starts here. It reads its own terminal with `hc get`. A suspended
-# agent's terminal (label herdr.suspended) gets the stand-in installed next to
-# this file; any other terminal gets $SHELL. No shell starts unless hc answered
-# without the label, so a message sent to a suspended agent never runs as a
-# command.
+# herdr-shell: hc's configured `shell`, so every new terminal starts here, and
+# so does every new program hc starts in a kept terminal after its program was
+# lost. It reads its own terminal with `hc get`. A suspended agent's terminal
+# (label herdr.suspended) gets the stand-in installed next to this file; any
+# other terminal gets $SHELL. No shell starts unless hc answered without the
+# label, so a message sent to a suspended agent never runs as a command.
+#
+# No `set -eu`: the launcher must never exit on an error, because a normal
+# exit finishes a kept terminal and its address. It prints the error and waits.
 
-case $0 in */*) standin=${0%/*}/herdr-standin ;; *) standin=./herdr-standin ;; esac
+case $0 in
+  */*) self=$0 ;;
+  *) self=$(command -v "$0") || self=./$0 ;;
+esac
+standin=${self%/*}/herdr-standin
 
-# Reads hc's JSON answer (one terminal) and prints "absent", or "suspended"
-# and then the address, the name and the label's agent, one per line.
-# Fails when the answer is not a terminal object.
-parse='
-function str(t,   out, c) {
+# An awk program. It reads hc's JSON answer (one terminal) and prints
+# "absent", or these lines: "suspended", the address, the name, the label's
+# agent, and "." (so that $(...) keeps empty values before it). It fails when
+# the answer is not a terminal object. Text before the first line that starts
+# with "{" is skipped. Names are for display: \u escapes and control
+# characters become "?".
+parse_terminal='
+function unquote(t,   out, c) {
   t = substr(t, 2, length(t) - 2); out = ""
   while (match(t, /\\/)) {
     out = out substr(t, 1, RSTART - 1); c = substr(t, RSTART + 1, 1)
@@ -21,6 +31,7 @@ function str(t,   out, c) {
   }
   return out t
 }
+s == "" && !/^[ \t]*[{]/ { next }
 { s = s $0 "\n" }
 END {
   while (s != "") {
@@ -28,16 +39,16 @@ END {
     if (match(s, /^"([^"\\]|\\.)*"/) || match(s, /^[][{}:,]/) || match(s, /^[^][{}:," \t\r\n]+/)) {
       tok = substr(s, 1, RLENGTH); s = substr(s, RLENGTH + 1)
     } else exit 1
-    if (tok == "{" || tok == "[") { if (!depth && tok != "{") exit 1; top = 1; kind[++depth] = tok; want_key = tok == "{"; continue }
+    if (tok == "{" || tok == "[") { if (!depth && tok != "{") exit 1; object = 1; kind[++depth] = tok; want_key = tok == "{"; continue }
     if (tok == "}" || tok == "]") { if (--depth < 0) exit 1; continue }
     if (tok == ",") { want_key = kind[depth] == "{"; continue }
     if (tok == ":" || !depth) continue
     if (want_key) { key[depth] = tok; want_key = 0; continue }
-    if (depth == 1 && key[1] == "\"address\"") address = str(tok)
-    if (depth == 1 && key[1] == "\"name\"" && tok != "null") name = str(tok)
-    if (depth == 2 && key[1] == "\"labels\"" && key[2] == "\"herdr.suspended\"") { found = 1; label = str(tok) }
+    if (depth == 1 && key[1] == "\"address\"") address = unquote(tok)
+    if (depth == 1 && key[1] == "\"name\"" && tok != "null") name = unquote(tok)
+    if (depth == 2 && key[1] == "\"labels\"" && key[2] == "\"herdr.suspended\"") { found = 1; label = unquote(tok) }
   }
-  if (!top || depth || address == "") exit 1
+  if (!object || depth || address == "") exit 1
   if (!found) { print "absent"; exit }
   agent = ""
   if (match(label, /"agent"[ ]*:[ ]*"[A-Za-z0-9_.-]*"/)) {
@@ -46,8 +57,10 @@ END {
   print "suspended"; print address; print name; print agent; print "."
 }'
 
-# Sets out and rc from `hc get`. Exit code 5 (kind unavailable) means the core
-# restarted while hc ran; that is retried for about 2 s. Other errors are not.
+# Sets out (hc's answer or error) and rc (its exit code) from `hc get`. Exit
+# code 5 (kind unavailable) means the core restarted while hc ran; that is
+# retried for about 2 s. Other errors are not. (Fractional sleep works with
+# the stock sleep of macOS, GNU coreutils and busybox.)
 lookup() {
   tries=0
   while :; do
@@ -66,17 +79,21 @@ while :; do
     problem='HC_TERMINAL_ID is not set, so this terminal cannot be checked'
   else
     lookup
-    # In JSON text, a quote inside a string is always escaped, so the label's
-    # key followed by a colon appears only where the label itself is. A
-    # normal terminal skips the parser (about 5 ms) through this check.
+    # A quote inside a JSON string is always escaped, so an answer without the
+    # text "herdr.suspended" in quotes cannot have the label, whatever its
+    # spacing. A normal terminal skips the parser (about 5 ms) this way. Any
+    # answer with that text goes to the parser, which decides.
     case $rc:$out in
-      0:*'"herdr.suspended":'*) parsed=$(printf '%s\n' "$out" | awk "$parse") || parsed= ;;
-      0:*'"labels":'*) parsed=absent ;;
+      0:*'"herdr.suspended"'*) parsed=$(printf '%s\n' "$out" | awk "$parse_terminal") || parsed= ;;
+      0:*'"labels"'*) parsed=absent ;;
       0:*) parsed= ;;
       *) parsed=failed ;;
     esac
     case $parsed in
-      absent) exec "${SHELL:-/bin/sh}" "$@" ;;
+      absent)
+        shell=${SHELL:-/bin/sh}
+        if [ -x "$shell" ] || command -v "$shell" > /dev/null 2>&1; then exec "$shell" "$@"; fi
+        problem="this terminal is not suspended, but the shell $shell cannot be started" ;;
       failed) problem="hc get $HC_TERMINAL_ID failed (exit $rc): $out" ;;
       suspended*)
         { IFS= read -r _; IFS= read -r address; IFS= read -r name; IFS= read -r agent; } <<EOF
