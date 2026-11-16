@@ -260,7 +260,6 @@ const SEEN_MS = 24 * 60 * MINUTE;
 // A suspended agent wakes when its tab stays focused this long. Stepping past
 // tabs (⌘P, the next-agent command) moves on sooner and wakes nothing.
 const WAKE_FOCUS_MS = 1_000;
-export { STANDIN_APP };
 
 // A stand-in that waits for a message: the suspension label, and an idle
 // report from the stand-in itself (not "working" while it wakes the agent,
@@ -314,7 +313,8 @@ const RESULT_MS = 10 * 60_000;
 const PROCESS_RETRY_MS = 5 * 60_000;
 
 /** @typedef {"keep" | "label" | "signal"} Step */
-/** @typedef {{ requested: number | null, suspended: boolean, reason: Outcome | null, at: number, source: "manual" | "auto" | "repair", step?: Step, rolledBack?: boolean }} RequestResult */
+/** @typedef {{ step?: Step, rolledBack?: boolean }} Failure where a suspension failed, and whether its label came off again */
+/** @typedef {{ requested: number | null, suspended: boolean, reason: Outcome | null, at: number, source: "manual" | "auto" | "repair" } & Failure} RequestResult */
 /** @typedef {{ agents: Record<string, { auto: Outcome | null, manual: Outcome | null }>, results: Record<string, RequestResult> }} SuspendState */
 
 /** @param {unknown} value @returns {Record<string, any>} */
@@ -326,7 +326,7 @@ function currentState() {
   return { agents: record(value.agents), results: record(value.results) };
 }
 
-/** @typedef {{ suspended: true } | { suspended: false, reason: Outcome, step?: Step, rolledBack?: boolean }} SuspendOutcome */
+/** @typedef {{ suspended: true } | ({ suspended: false, reason: Outcome } & Failure)} SuspendOutcome */
 
 // The reason of a verdict or of a suspension's outcome, null when it passed.
 /** @param {Verdict | SuspendOutcome} result @returns {Outcome | null} */
@@ -585,7 +585,7 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
    * @returns {Promise<SuspendOutcome>}
    */
   async function suspend(address, { now = clock(), manual = false } = {}) {
-    /** @param {Outcome} reason @param {{ step?: Step, rolledBack?: boolean }} [more] @returns {SuspendOutcome} */
+    /** @param {Outcome} reason @param {Failure} [more] @returns {SuspendOutcome} */
     const abort = (reason, more = {}) => ({ suspended: false, reason, ...more });
     if (!await suspensionInstalled()) return abort("not-installed");
     if (closed) return abort("closed");

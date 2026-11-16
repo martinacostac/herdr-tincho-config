@@ -40,6 +40,12 @@ const ICONS = "mods/workspace-chrome";
 // The avatar colors the shipped spaces list uses, so a space keeps its color.
 const MARK = { ansi6: "#22a99a", ansi3: "#e3814f", ansi4: "#5b8def", ansi5: "#8b7cf6", ansi2: "#3fae6a", ansi1: "#d9649a" };
 const RANK = { blocked: 4, done: 3, working: 2, idle: 1 };
+// The most urgent of some statuses (RANK), or null.
+const topStatus = (statuses) => statuses.reduce((m, st) => ((RANK[st] ?? 0) > (RANK[m] ?? 0) ? st : m), null);
+
+// A program table entry (herdr.d.ts Program) for a program the table did not
+// describe: a shell, or a plain program, without an icon.
+const plainProgram = (name, shell) => ({ key: shell ? "shell" : "program", name, icon: null, tint: false, tile: null, color: null, shell, agent: false });
 
 function icon(p, size, color) {
   if (!p?.icon) return null;
@@ -280,7 +286,7 @@ export default class TabTree extends View {
   // is set (herdr-shell runs before the stand-in reports), else null.
   // A live agent that reports its own status is never shown suspended, even
   // when a suspension label was left on its terminal (the policy removes it).
-  // render() has already dropped a stale waking report (actual()).
+  // render() has already dropped a stale waking report (shownPane()).
   heldState(p) {
     if (!p.terminal) return null;
     if (p.app === STANDIN_APP && p.status === "working") return "waking";
@@ -296,17 +302,16 @@ export default class TabTree extends View {
   // longer a wake (waking() in resume.js: the woken agent exited, or never
   // reported) is dropped: the pane shows what runs in front instead, a shell
   // (with ↻) or a plain program. cores: terminals() by address.
-  actual(p, now) {
+  shownPane(p, now) {
     const core = p.terminal ? this.cores?.get(p.terminal) : null;
     if (!core || p.app !== STANDIN_APP || p.status !== "working" || waking(core, now)) return p;
     const front = frontProgram(core);
     const shell = Boolean(front?.shell);
-    const program = { key: shell ? "shell" : "program", name: front?.name || "program", icon: null, tint: false, tile: null, color: null, shell, agent: false };
-    return { ...p, status: null, app: null, program };
+    return { ...p, status: null, app: null, program: plainProgram(front?.name || "program", shell) };
   }
 
   // A wake that ends by the clock changes no terminal, so nothing re-renders
-  // the row: one sleep wakes the view at the earliest end of a wake now shown
+  // the row: one cx.sleep re-renders the view at the earliest end of a wake now shown
   // (WAKE_MS after it began; a stand-in still in front is checked again
   // WAKE_MS later). No periodic timer.
   scheduleWakeEnd(cx, now) {
@@ -531,7 +536,7 @@ export default class TabTree extends View {
     const open = !this.folded.has(g.key);
     const hovered = this.hovered === g.key;
     const active = g.spaces.some((s) => s.active);
-    const top = g.tabs.reduce((m, x) => ((RANK[x.tab.status] ?? 0) > (RANK[m] ?? 0) ? x.tab.status : m), null);
+    const top = topStatus(g.tabs.map((x) => x.tab.status));
     const id = g.key.replace(/[^\w-]/g, "_");
     const avatar = this.avatar(fill, g.name);
     const select = () => run("space.select", { id: home.id });
@@ -595,10 +600,7 @@ export default class TabTree extends View {
       for (let tab of s.tabs) {
         const root = this.tree(tab, ps);
         if (!root) continue;
-        if (this.restatus?.has(tab.id)) {
-          const status = ps.filter((p) => p.tab === tab.id).reduce((m, p) => ((RANK[p.status] ?? 0) > (RANK[m] ?? 0) ? p.status : m), null);
-          tab = { ...tab, status };
-        }
+        if (this.recomputedTabs?.has(tab.id)) tab = { ...tab, status: topStatus(ps.filter((p) => p.tab === tab.id).map((p) => p.status)) };
         const git = root.p.terminal ? this.gitOf(s.machine, root.p.cwd, cx) : null;
         g.root ??= git?.root ?? null;
         g.tabs.push({ s, tab, root, wt: git?.worktree ?? null });
@@ -761,9 +763,9 @@ export default class TabTree extends View {
     this.labels = new Map(cores.map((t) => [t.address, t.labels ?? {}]));
     this.scheduleWakeEnd(cx, now);
     const raw = panes();
-    const ps = raw.map((p) => this.actual(p, now));
+    const ps = raw.map((p) => this.shownPane(p, now));
     // A tab whose pane lost a stale report: its status from its panes again.
-    this.restatus = new Set(ps.filter((p, i) => p !== raw[i]).map((p) => p.tab));
+    this.recomputedTabs = new Set(ps.filter((p, i) => p !== raw[i]).map((p) => p.tab));
     const sp = spaces();
     this.colors(sp);
     const groups = this.groups(sp, ps, cx);
