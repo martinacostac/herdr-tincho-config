@@ -201,19 +201,26 @@ install_suspend() (
   echo "$want herdr-shell" >> "$next"
   if cmp -s "$next" "$manifest"; then rm -f "$next"; else mv -f "$next" "$manifest"; fi
   echo "suspend: $changed installed -> $bin"
-  shell_key
+  # Here, not in install(): without Bun the step above returns early, and
+  # the shell setting is then left unchanged.
+  install_shell_key
 )
 
-# An awk program for herdr-core's config (TOML). It finds the top-level
-# `shell` key (before the first table header), also when its list spans
-# lines. With mode=check it prints "absent", "same" (the value is a list of
-# only the path in ENVIRON["path"], ENVIRON["esc"] in a basic string), or "other" and the key's lines. With
-# mode=write it prints the file with that key set to ENVIRON["line"]: in
-# place of the old key, or else after the last top-level line (before the
-# comments and blank lines over the first table header). Every other line is
-# printed as it is.
+# An awk program that reads herdr-core's config (TOML). It finds the
+# top-level `shell` key (above the first table header), also when its list
+# spans lines.
+# - mode=check prints one word: "same" when the value is a list that holds
+#   only ENVIRON["path"] (ENVIRON["esc"] is that path escaped for a "..."
+#   string), "absent", "unreadable", or "other" followed by the key's lines.
+#   "unreadable" means a multi-line string, unbalanced brackets, or a
+#   top-level line that is not a key, a table header or a comment: such a
+#   file is not edited.
+# - mode=write prints the file with ENVIRON["line"] in place of the key, or
+#   else after the last top-level key (above the comments and blank lines
+#   over the first table header). It prints every other line as it is.
 toml_shell='
-# s without spaces and comments outside strings; counts brackets in depth.
+# s without spaces and without a comment outside strings. Adds the brackets
+# that s opens or closes to depth.
 function strip(s,   out, i, c, q) {
   out = ""; q = ""
   for (i = 1; i <= length(s); i++) {
@@ -234,29 +241,38 @@ function strip(s,   out, i, c, q) {
   return out
 }
 { line[NR] = $0 }
+/"""|\047\047\047/ { unreadable = 1 }
 table { next }
 depth > 0 {
-  s = strip($0)
-  if (inshell) { value = value s; if (depth <= 0) { inshell = 0; last = NR } }
+  value_part = strip($0)
+  if (in_shell) { value = value value_part; if (depth <= 0) { in_shell = 0; end = NR } }
+  if (depth < 0) unreadable = 1
   next
 }
 /^[ \t]*\[/ { table = NR; next }
-!first && /^[ \t]*(shell|"shell"|\047shell\047)[ \t]*=/ {
-  first = last = NR; rest = $0; sub(/^[^=]*=/, "", rest)
-  value = strip(rest); if (depth > 0) inshell = 1
-  next
+{
+  # A bare, quoted or dotted key and its "=".
+  if (!match($0, /^[ \t]*([A-Za-z0-9_-]+|"([^"\\]|\\.)*"|\047[^\047]*\047)([ \t]*\.[ \t]*([A-Za-z0-9_-]+|"([^"\\]|\\.)*"|\047[^\047]*\047))*[ \t]*=/)) {
+    if (strip($0) != "") unreadable = 1
+    next
+  }
+  value_part = strip(substr($0, RLENGTH + 1))
+  if (depth < 0) unreadable = 1
+  if (!first && $0 ~ /^[ \t]*(shell|"shell"|\047shell\047)[ \t]*=/) {
+    first = end = NR; value = value_part; if (depth > 0) in_shell = 1
+  }
 }
-{ rest = $0; sub(/^[^=]*=/, "", rest); strip(rest) }
 END {
   path = ENVIRON["path"]; esc = ENVIRON["esc"]
   if (mode == "check") {
+    if (unreadable || depth != 0) { print "unreadable"; exit }
     if (!first) { print "absent"; exit }
     if (value == "[\"" esc "\"]" || value == "[\"" esc "\",]" ||
         (index(path, "\047") == 0 && (value == "[\047" path "\047]" || value == "[\047" path "\047,]"))) {
       print "same"; exit
     }
     print "other"
-    for (i = first; i <= last; i++) print line[i]
+    for (i = first; i <= end; i++) print line[i]
     exit
   }
   at = NR + 1
@@ -267,18 +283,18 @@ END {
   }
   for (i = 1; i <= NR + 1; i++) {
     if (i == at) print ENVIRON["line"]
-    if (first && i >= first && i <= last) continue
+    if (first && i >= first && i <= end) continue
     if (i <= NR) print line[i]
   }
 }'
 
 # Points herdr-core's `shell` setting at the installed herdr-shell, by its
 # absolute path (hc runs the path as written). Only that key changes. A
-# missing file is created with only that key, an identical value is left
-# alone (nothing is written, so --watch does not rewrite it on every pass),
-# and a different value is reported and kept, or with --force replaced
-# after a copy of the file is kept as config.toml.orig.
-shell_key() {
+# missing file is created with only that key, and an identical value is left
+# alone (nothing is written, so --watch does not rewrite it on every pass). A
+# different value is reported and kept; --force replaces it and keeps a copy
+# of the file as config.toml.orig. A file it cannot read is never edited.
+install_shell_key() {
   if [ ! -x "$bin/herdr-shell" ] || [ ! -x "$bin/herdr-standin" ]; then
     echo "suspend: shell setting unchanged (herdr-standin is not installed)"
     return 0
@@ -291,17 +307,19 @@ shell_key() {
   fi
   esc=$(printf '%s\n' "$path" | sed 's/[\\"]/\\&/g')
   line="shell = [\"$esc\"]"
-  if [ -f "$core" ]; then
-    found=$(path=$path esc=$esc awk -v mode=check "$toml_shell" "$core")
-  else
-    found=missing
-  fi
-  case $found in
+  check=missing
+  [ ! -f "$core" ] || check=$(path=$path esc=$esc awk -v mode=check "$toml_shell" "$core")
+  result=$(printf '%s\n' "$check" | head -n 1)
+  case $result in
     same) return 0 ;;
-    other*)
+    unreadable)
+      echo "skipped    shell in $core: it has a multi-line string or a line this installer cannot read"
+      echo "           set it by hand: $line"
+      return 0 ;;
+    other)
       if ! $force; then
         echo "skipped    shell in $core: herdr-shell needs $line, the file has:"
-        printf '%s\n' "$found" | sed '1d; s/^/             /'
+        printf '%s\n' "$check" | sed '1d; s/^/             /'
         echo '           (--force replaces it, keeping a .orig copy)'
         return 0
       fi
@@ -316,10 +334,12 @@ shell_key() {
   else
     printf '%s\n' "$line" > "$tmp"
   fi
-  # A linked config (a dotfiles repo) is written through the link.
+  # A linked config (from a dotfiles repo) is written through the link, so
+  # the link stays. That write is not a rename, so hc could read it half
+  # written for a moment; keeping the link is worth that.
   if [ -L "$core" ]; then cat "$tmp" > "$core"; rm -f "$tmp"; else mv -f "$tmp" "$core"; fi
-  case $found in
-    other*) echo "overwrote  shell in $core (previous copy: $core.orig)" ;;
+  case $result in
+    other) echo "overwrote  shell in $core (previous copy: $core.orig)" ;;
     *) echo "set        $line in $core" ;;
   esac
 }

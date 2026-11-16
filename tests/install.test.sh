@@ -474,6 +474,30 @@ assert_same "$case_dir/before" "$core"
 assert_absent "$core.orig"
 echo 'ok - without bun the shell key is left unchanged, even with --force'
 
+fixture shell-key-unreadable
+suspend_sources
+fake_bun aot
+mkdir -p "$(dirname "$core")"
+# A multi-line string can hide a line that looks like a table or a key: the
+# installer reports and keeps such a file.
+for content in 'motd = """\n[not a table]\n"""\n' "motd = '''\nshell = 1\n'''\n"; do
+  printf "$content" > "$core"
+  cp "$core" "$case_dir/before"
+  run --force > "$log"
+  assert_same "$case_dir/before" "$core"
+  assert_absent "$core.orig"
+  assert_log "skipped    shell in $core"
+done
+# A quoted key can hold "=" and brackets; the list after it still ends.
+printf '"a=[b" = [1,\n2]\nh = [\n[1]\n]\nshell = ["fish"]\n' > "$core"
+run --force > "$log"
+{
+  printf '"a=[b" = [1,\n2]\nh = [\n[1]\n]\n'
+  printf 'shell = ["%s/herdr-shell"]\n' "$bin"
+} > "$case_dir/expected"
+assert_same "$case_dir/expected" "$core"
+echo 'ok - a config with multi-line strings is reported and kept; quoted keys are read'
+
 fixture shell-key-xdg
 suspend_sources
 fake_bun aot
