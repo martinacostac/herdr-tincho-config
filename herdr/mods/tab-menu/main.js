@@ -5,10 +5,110 @@
 // target.terminal names the terminal to tag (a tab: its primary pane's).
 // ↑/↓ move, Enter runs, Esc closes. An item is [label, command, args];
 // a command "worktree" opens the worktree dialog instead, "tag" the tag-prompt one.
+// Agent tabs also get "Suspend now" and "Never suspend" (GLOSSARY.md: Suspend,
+// Pinned agent): commands "suspend" and "pin", handled here.
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { run, props, closeOverlay, openOverlay, theme, keys, terminals, spaces, panes, exec } from "herdr";
+import { run, props, closeOverlay, openOverlay, theme, keys, terminals, spaces, panes, exec, hc, shared, setShared, notify } from "herdr";
+
+// The suspension policy's entry point (tab-tree's suspend-policy.js; mods
+// can't import each other, so the names are repeated here).
+// REQUESTS: { [address]: ms }, a manual suspension request per terminal.
+// STATE: { agents: { [address]: { auto, manual } }, results: { [address]:
+// { requested, suspended, reason, at } } }, written by the leading copy.
+const SUSPEND_REQUESTS = "tincho.suspend.requests";
+const SUSPEND_STATE = "tincho.suspend.state";
+const NEVER_SUSPEND = "herdr.never-suspend";
+const SUSPENDED = "herdr.suspended";
+
+// Menu text for each reason the policy gives (an unknown one shows as is).
+const REASONS = {
+  off: "automatic suspension off",
+  remote: "remote terminal",
+  suspended: "already suspended",
+  "not-resumable": "not resumable",
+  pinned: "pinned",
+  focused: "focused",
+  working: "working",
+  blocked: "blocked",
+  "not-idle": "not idle",
+  recent: "idle too briefly",
+  "processes-unknown": "processes unknown",
+  background: "background processes",
+  "not-installed": "not installed",
+  gone: "terminal ended",
+  changed: "agent changed",
+  failed: "hc command failed",
+  closed: "tab tree closed",
+};
+// The shared reasons skip the process rule, so these show only in a result.
+const PROCESS_REASONS = new Set(["background", "processes-unknown"]);
+// Reasons the policy checks before the pin.
+const BEFORE_PIN = new Set(["remote", "suspended", "not-resumable"]);
+
+/** @param {unknown} value @returns {Record<string, any>} */
+const record = (value) => value && typeof value === "object" && !Array.isArray(value) ? /** @type {any} */ (value) : {};
+
+function suspendState() {
+  const value = record(shared(SUSPEND_STATE));
+  return { agents: record(value.agents), results: record(value.results) };
+}
+
+// The local agent a tab shows (also a suspended one), or nothing.
+function tabAgent(address) {
+  if (!address || address.includes("/")) return null;
+  const term = terminals().find((t) => t.address === address);
+  if (!term) return null;
+  return term.program?.agent || term.report || Object.hasOwn(term.labels ?? {}, SUSPENDED) ? term : null;
+}
+
+// Why "Suspend now" would fail now, or null: the labels first (they change at
+// once), then the leader's last pass (every 15 s), then the process rule from
+// the last request's result.
+function suspendReason(term) {
+  const labels = term.labels ?? {};
+  if (Object.hasOwn(labels, SUSPENDED)) return "suspended";
+  const pinned = labels[NEVER_SUSPEND] === "1";
+  const { agents, results } = suspendState();
+  let reason = agents[term.address]?.manual ?? null;
+  if (reason === "pinned" && !pinned) reason = null; // unpinned since that pass
+  if (pinned && !BEFORE_PIN.has(reason)) return "pinned";
+  if (reason !== null) return reason;
+  const last = results[term.address];
+  return last?.suspended === false && PROCESS_REASONS.has(last.reason) ? last.reason : null;
+}
+
+// Sets or clears the pin (hc label <t> key= removes the label). The menu is
+// closed by then, so a failure is a notification.
+async function setPin(address, pin) {
+  const r = await hc(["label", address, `${NEVER_SUSPEND}=${pin ? "1" : ""}`]).catch((e) => ({ code: -1, stderr: String(e) }));
+  if (r?.code === 0) return;
+  notify({ title: pin ? "Never suspend failed" : "Removing Never suspend failed", body: String(r?.stderr ?? "").trim() || address, level: "error" });
+}
+
+const cannot = (reason) => `Can't suspend: ${REASONS[reason] ?? String(reason)}`;
+
+// The suspension items for an agent tab. request: this menu's own request
+// ({ address, at }), whose result replaces the item's text.
+function suspendItems(address, request) {
+  const term = tabAgent(address);
+  if (!term) return [];
+  let label;
+  if (request?.address === term.address) {
+    const result = suspendState().results[term.address];
+    if (result?.requested !== request.at) label = "Suspending…";
+    else label = result.suspended ? "Suspended" : cannot(result.reason);
+  } else {
+    const reason = suspendReason(term);
+    label = reason === null ? "Suspend now" : cannot(reason);
+  }
+  const pinned = term.labels?.[NEVER_SUSPEND] === "1";
+  return [
+    [label, "suspend", { terminal: term.address }],
+    [pinned ? "Remove Never suspend" : "Never suspend", "pin", { terminal: term.address, pin: !pinned }],
+  ];
+}
 
 // The tag item for a local terminal, or nothing (labels live in this machine's core).
 function tagItem(address) {
@@ -32,7 +132,7 @@ async function checkout(folder, on) {
   return common.stdout.trim() === `${top.stdout.trim()}/.git` ? "main" : "linked";
 }
 
-function items(p, git) {
+function items(p, git, request) {
   p = p ?? {};
   const tg = p.target ?? {};
   switch (p.tab) {
@@ -63,6 +163,7 @@ function items(p, git) {
       return [
         ["Rename", "tab.rename", { id: tg.id }],
         ...tagItem(tg.terminal),
+        ...suspendItems(tg.terminal, request),
         ["New tab", "tab.new", { space: tg.space }],
         ["Close", "tab.close", { id: tg.id }],
       ];
@@ -86,7 +187,7 @@ function items(p, git) {
 }
 
 function menuIcon(command) {
-  const name = command.endsWith(".close") ? "x" : command.endsWith(".rename") ? "square-pen" : command.endsWith(".new") ? "plus" : command === "worktree" ? "git-branch" : command === "app.help" ? "terminal" : command === "app.theme" ? "settings" : command === "pane.split" ? "panel-right" : command === "pane.zoom" ? "square" : command === "tag" ? "pin" : "terminal";
+  const name = command.endsWith(".close") ? "x" : command.endsWith(".rename") ? "square-pen" : command.endsWith(".new") ? "plus" : command === "worktree" ? "git-branch" : command === "app.help" ? "terminal" : command === "app.theme" ? "settings" : command === "pane.split" ? "panel-right" : command === "pane.zoom" ? "square" : command === "tag" ? "pin" : command === "suspend" ? "clock" : command === "pin" ? "pin" : "terminal";
   return `mods/workspace-chrome/${name}.svg`;
 }
 
@@ -102,6 +203,7 @@ export default class Menu extends View {
   init(_props, cx) {
     this.at = 0;
     this.git = null;
+    this.request = null;
     this.handle = cx.focus_handle();
     this.handle.focus();
     const p = props();
@@ -115,9 +217,19 @@ export default class Menu extends View {
   }
 
   choose(i, cx) {
-    const it = items(props(), this.git)[i];
+    const it = items(props(), this.git, this.request)[i];
     if (!it) return;
+    // The menu stays open to show the result; setShared re-renders it.
+    if (it[1] === "suspend") {
+      const address = it[2].terminal;
+      this.request = { address, at: Date.now() };
+      // Merge: other terminals' requests stay.
+      setShared(SUSPEND_REQUESTS, { ...record(shared(SUSPEND_REQUESTS)), [address]: this.request.at });
+      cx.notify();
+      return;
+    }
     closeOverlay(props()?.overlay);
+    if (it[1] === "pin") return void setPin(it[2].terminal, it[2].pin);
     if (it[1] === "tag") openOverlay({ mod: "tag-prompt", kind: "dialog", width: 380, props: it[2] });
     else if (it[1] === "worktree") openOverlay({ mod: "worktree", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : { width: 440, height: 260 }), props: it[2] });
     else run(it[1], it[2]);
@@ -125,7 +237,7 @@ export default class Menu extends View {
 
   render(cx) {
     const t = theme();
-    const list = items(props(), this.git);
+    const list = items(props(), this.git, this.request);
     return v_flex()
       .id("menu")
       .track_focus(this.handle)
