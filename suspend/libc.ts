@@ -1,4 +1,6 @@
-// The libc calls Bun has no API for, through bun:ffi: replacing this process.
+// The libc calls Bun has no API for, through bun:ffi: replacing this process,
+// and removing a variable from the environment it passes on (deleting from
+// process.env does not reach the environment execvp uses).
 // libc.dylib on macOS, libc.so.6 on Linux. Opened on first use only.
 
 import { dlopen, FFIType, ptr, read, type Pointer } from "bun:ffi";
@@ -13,6 +15,7 @@ function open() {
     execvp: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
     signal: { args: [FFIType.i32, FFIType.ptr], returns: FFIType.ptr },
     strerror: { args: [FFIType.i32], returns: FFIType.cstring },
+    unsetenv: { args: [FFIType.ptr], returns: FFIType.i32 },
     [ERRNO]: { args: [], returns: FFIType.ptr },
   });
 }
@@ -36,4 +39,10 @@ export function execvp(argv: string[]): string {
   const errno = read.i32(symbols[ERRNO]() as Pointer, 0);
   for (const signal of ignored) symbols.signal(signal, SIG_IGN as never);
   return String(symbols.strerror(errno));
+}
+
+/** Removes name from the environment that execvp passes on. */
+export function unsetenv(name: string): void {
+  lib ??= open();
+  lib.symbols.unsetenv(ptr(Buffer.from(`${name}\0`)));
 }

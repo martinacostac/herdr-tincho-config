@@ -19,7 +19,7 @@ trap 'exit 1' HUP INT TERM
 
 fail() {
   echo "FAIL [$interp] $case_name: $*" >&2
-  for f in out ran hc.log; do
+  for f in out ran pending hc.log; do
     [ -f "$case/$f" ] && { echo "--- $f" >&2; cat "$case/$f" >&2; }
   done
   exit 1
@@ -32,6 +32,11 @@ assert_ran() {
 }
 assert_nothing_ran() { [ ! -e "$case/ran" ] || fail "started: $(cat "$case/ran")"; }
 assert_out() { grep -F -- "$1" "$case/out" >/dev/null || fail "missing output: $1"; }
+# The lines herdr-shell passed on in HERDR_STANDIN_PENDING ("unset": none).
+assert_pending() {
+  printf '%s\n' "$1" > "$case/expected-pending"
+  cmp -s "$case/expected-pending" "$case/pending" || fail "pending: $(cat "$case/pending" 2>/dev/null), expected: $1"
+}
 hc_calls() { if [ -f "$case/hc.log" ]; then wc -l < "$case/hc.log" | tr -d ' '; else echo 0; fi; }
 
 # A JSON answer of hc get, shaped like hc 0.1.21 prints it: one line, sorted keys.
@@ -57,13 +62,21 @@ new_case() {
   bin="$case/bin dir"
   mkdir -p "$bin" "$case/path"
   cp "$project/suspend/herdr-shell" "$bin/herdr-shell"
+  # Each fake records its words, and the lines herdr-shell kept for it (or "unset").
   cat > "$bin/herdr-standin" <<'EOF'
 #!/bin/sh
+printf '%s\n' "${HERDR_STANDIN_PENDING-unset}" > "$CASE/pending"
 printf '%s\n' standin "$@" > "$CASE/ran"
 EOF
   cat > "$case/path/fake-shell" <<'EOF'
 #!/bin/sh
+printf '%s\n' "${HERDR_STANDIN_PENDING-unset}" > "$CASE/pending"
 printf '%s\n' shell "$@" > "$CASE/ran"
+EOF
+  # The system the launcher sees: UNAME=Darwin for macOS.
+  cat > "$case/path/uname" <<'EOF'
+#!/bin/sh
+echo "${UNAME:-Linux}"
 EOF
   cat > "$case/path/hc" <<'EOF'
 #!/bin/sh
@@ -75,7 +88,7 @@ rc=$(head -n 1 "$file")
 if [ "$rc" -eq 0 ]; then tail -n +2 "$file"; else tail -n +2 "$file" >&2; fi
 exit "$rc"
 EOF
-  chmod +x "$bin/herdr-standin" "$case/path/fake-shell" "$case/path/hc"
+  chmod +x "$bin/herdr-standin" "$case/path/fake-shell" "$case/path/hc" "$case/path/uname"
   launcher="$bin/herdr-shell"
   fake_shell="$case/path/fake-shell"
   # Only these variables reach the launcher; the real hc and core stay out of reach.
@@ -129,7 +142,7 @@ stop_waiting() {
 # Waits up to 5 s for the launcher to ask for Enter.
 wait_prompt() {
   i=0
-  while ! grep -F 'Press Enter to try again' "$case/out" >/dev/null && [ "$i" -lt 50 ]; do
+  while ! grep -F 'to try again' "$case/out" >/dev/null && [ "$i" -lt 50 ]; do
     sleep 0.1
     i=$((i + 1))
   done
@@ -147,14 +160,41 @@ run_cases() {
   assert_ran shell -l "two words"
   [ "$(cat "$case/hc.log")" = "get t7 --json" ] || fail "hc called as: $(cat "$case/hc.log")"
 
-  new_case label-present-starts-standin
+  new_case label-present-starts-standin-with-shell-arguments
   terminal_json "{\"herdr.last-agent\":\"pi\",$suspended_label}" '"impl"' | answer 0
-  launch HC_TERMINAL_ID=t7 "SHELL=$fake_shell" -- -l
+  launch HC_TERMINAL_ID=t7 "SHELL=$fake_shell" -- -l "two words"
+  assert_ran standin pi t7 impl -l "two words"
+  assert_pending unset
+
+  new_case macos-without-arguments-starts-login-shell
+  terminal_json '{}' '"impl"' | answer 0
+  launch HC_TERMINAL_ID=t7 UNAME=Darwin "SHELL=$fake_shell" --
+  assert_ran shell -l
+
+  new_case macos-with-arguments-passes-them-unchanged
+  terminal_json '{}' '"impl"' | answer 0
+  launch HC_TERMINAL_ID=t7 UNAME=Darwin "SHELL=$fake_shell" -- -i
+  assert_ran shell -i
+
+  new_case linux-without-arguments-starts-plain-shell
+  terminal_json '{}' '"impl"' | answer 0
+  launch HC_TERMINAL_ID=t7 "SHELL=$fake_shell" --
+  assert_ran shell
+
+  new_case macos-without-arguments-standin-gets-l
+  terminal_json "{$suspended_label}" '"impl"' | answer 0
+  launch HC_TERMINAL_ID=t7 UNAME=Darwin "SHELL=$fake_shell" --
+  assert_ran standin pi t7 impl -l
+
+  new_case inherited-pending-variable-is-never-passed-on
+  terminal_json "{$suspended_label}" '"impl"' | answer 0
+  launch HC_TERMINAL_ID=t7 HERDR_STANDIN_PENDING=forged "SHELL=$fake_shell" --
   assert_ran standin pi t7 impl
+  assert_pending unset
 
   new_case standin-gets-exact-name
   terminal_json "{\"name\":\"not this\",$suspended_label}" '" my \"agent\" \\ one "' | answer 0
-  launch HC_TERMINAL_ID=t7 -- -l
+  launch HC_TERMINAL_ID=t7 --
   assert_ran standin pi t7 ' my "agent" \ one '
 
   new_case unnamed-terminal-standin-gets-empty-name
@@ -213,7 +253,7 @@ run_cases() {
   wait_prompt
   assert_out 'herdr-shell: hc get t7 failed (exit 5)'
   assert_out 'the core restarted while this ran'
-  assert_out 'Press Enter to try again'
+  assert_out 'Press Enter on an empty line to try again'
   assert_nothing_ran
   calls=$(hc_calls)
   [ "$calls" -gt 3 ] || fail "hc called $calls times, expected retries"
@@ -224,6 +264,40 @@ run_cases() {
   echo >&4
   wait_ran
   assert_ran shell
+  wait "$bg_pid" || fail 'the shell did not replace the launcher'
+  bg_pid=
+  exec 4>&-
+
+  new_case waiting-keeps-delivered-lines-for-the-standin
+  printf '%s\n' '{"error":{"kind":"not_found","message":"no terminal \"t7\""}}' | answer 1 3
+  terminal_json "{$suspended_label}" '"impl"' | answer 0
+  launch_waiting HC_TERMINAL_ID=t7 "SHELL=$fake_shell" --
+  wait_prompt
+  # Sent messages are lines, not the Enter that tries again.
+  printf 'first message\n  indented second; rm -rf ~\n' >&4
+  sleep 0.5
+  [ "$(hc_calls)" -eq 1 ] || fail 'a delivered line counted as Enter'
+  assert_nothing_ran
+  echo >&4
+  wait_ran
+  assert_ran standin pi t7 impl
+  assert_pending "first message
+  indented second; rm -rf ~"
+  wait "$bg_pid" || fail 'the stand-in did not replace the launcher'
+  bg_pid=
+  exec 4>&-
+
+  new_case waiting-drops-delivered-lines-when-a-shell-starts
+  printf '%s\n' '{"error":{"kind":"not_found","message":"no terminal \"t7\""}}' | answer 1 3
+  terminal_json '{}' '"impl"' | answer 0
+  launch_waiting HC_TERMINAL_ID=t7 "SHELL=$fake_shell" --
+  wait_prompt
+  printf 'touch %s\n\n' "$case/ran-by-shell" >&4
+  wait_ran
+  assert_ran shell
+  assert_pending unset
+  assert_out 'dropped, not run'
+  [ ! -e "$case/ran-by-shell" ] || fail 'a delivered line ran'
   wait "$bg_pid" || fail 'the shell did not replace the launcher'
   bg_pid=
   exec 4>&-
@@ -286,7 +360,7 @@ new_case executable-finds-standin-next-to-itself
 terminal_json "{$suspended_label}" '"impl"' | answer 0
 [ -x "$launcher" ] || fail 'the launcher is not executable'
 launch HC_TERMINAL_ID=t7 -- -l
-assert_ran standin pi t7 impl
+assert_ran standin pi t7 impl -l
 
 # Started by its bare name from its own folder ($0 has no slash).
 interp=sh

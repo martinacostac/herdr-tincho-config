@@ -1,15 +1,17 @@
 // The real System for the stand-in: the terminal on stdin/stdout, hc on PATH,
 // the file system, the clock, and execvp. Kept thin: no stand-in logic here.
 
-import { mkdirSync, writeFileSync, writeSync } from "node:fs";
+import { mkdirSync, readdirSync, writeFileSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
-import { execvp } from "./libc";
+import { execvp, unsetenv } from "./libc";
 import type { System } from "./standin";
 
 export function system(): System {
   const stdin = process.stdin;
   return {
     env: process.env,
+    platform: process.platform,
+    unsetenv(name) { unsetenv(name); delete process.env[name]; },
     write: (text) => { writeSync(1, text); },
     listen(onData) {
       stdin.setEncoding("utf8");
@@ -26,6 +28,12 @@ export function system(): System {
         return { code: 127, stdout: "" };
       }
     },
+    async background(argv) {
+      await Bun.spawn(argv, { stdin: "ignore", stdout: "inherit", stderr: "ignore" }).exited;
+    },
+    async list(dir) {
+      try { return readdirSync(dir); } catch { return []; }
+    },
     async readHead(path) {
       try { return await Bun.file(path).slice(0, 4096).text(); } catch { return null; }
     },
@@ -39,5 +47,14 @@ export function system(): System {
     exec: async (argv) => execvp(argv),
     now: () => Date.now(),
     after: (ms, run) => { setTimeout(run, ms); },
+    onError(handler) {
+      let alive: ReturnType<typeof setInterval> | null = null;
+      const keep = (error: unknown) => {
+        alive ??= setInterval(() => {}, 2 ** 30); // nothing else may be left to keep the process alive
+        try { handler(error); } catch { /* the handler failed too: stay alive anyway */ }
+      };
+      process.on("uncaughtException", keep);
+      process.on("unhandledRejection", keep);
+    },
   };
 }

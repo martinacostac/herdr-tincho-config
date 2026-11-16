@@ -15,6 +15,19 @@ case $0 in
 esac
 standin=${self%/*}/herdr-standin
 
+# hc starts login shells on macOS, but runs a configured shell exactly as
+# written, so this launcher gets no arguments there: the user's shell gets -l.
+# The stand-in gets the same arguments, for the shell it hands over to.
+if [ $# -eq 0 ] && [ "$(uname -s 2>/dev/null)" = Darwin ]; then set -- -l; fi
+
+# Lines that arrive while the launcher waits (below) are messages sent to the
+# terminal. They are kept for the stand-in in HERDR_STANDIN_PENDING, never run,
+# and never taken from the environment this launcher got.
+unset HERDR_STANDIN_PENDING
+pending=
+nl='
+'
+
 # An awk program. It reads hc's JSON answer (one terminal) and prints
 # "absent", or these lines: "suspended", the address, the name, the label's
 # agent, and "." (so that $(...) keeps empty values before it). It fails when
@@ -92,19 +105,33 @@ while :; do
     case $parsed in
       absent)
         shell=${SHELL:-/bin/sh}
-        if [ -x "$shell" ] || command -v "$shell" > /dev/null 2>&1; then exec "$shell" "$@"; fi
+        if [ -x "$shell" ] || command -v "$shell" > /dev/null 2>&1; then
+          [ -n "$pending" ] && printf 'herdr-shell: this terminal is not suspended; the lines typed while it waited were dropped, not run.\n' >&2
+          exec "$shell" "$@"
+        fi
         problem="this terminal is not suspended, but the shell $shell cannot be started" ;;
       failed) problem="hc get $HC_TERMINAL_ID failed (exit $rc): $out" ;;
       suspended*)
         { IFS= read -r _; IFS= read -r address; IFS= read -r name; IFS= read -r agent; } <<EOF
 $parsed
 EOF
-        [ -x "$standin" ] && exec "$standin" "$agent" "$address" "$name"
+        if [ -x "$standin" ]; then
+          if [ -n "$pending" ]; then HERDR_STANDIN_PENDING=$pending; export HERDR_STANDIN_PENDING; fi
+          exec "$standin" "$agent" "$address" "$name" "$@"
+        fi
         problem="this agent is suspended, but the stand-in $standin is missing" ;;
       *) problem="hc get $HC_TERMINAL_ID gave an answer that cannot be read: $out" ;;
     esac
   fi
   printf 'herdr-shell: %s\n' "$problem" >&2
-  printf 'herdr-shell: no shell was started, so no message can run as a command. Press Enter to try again.\n' >&2
-  read -r _ || sleep 1
+  printf 'herdr-shell: no shell was started, so no message can run as a command. Press Enter on an empty line to try again.\n' >&2
+  # Only an empty line tries again: a line with text is a message sent to the
+  # agent, kept for the stand-in.
+  while :; do
+    IFS= read -r line || { sleep 1; break; }
+    case $line in
+      *[![:space:]]*) pending=${pending:+$pending$nl}$line ;;
+      *) break ;;
+    esac
+  done
 done

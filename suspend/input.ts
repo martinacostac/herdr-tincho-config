@@ -1,6 +1,7 @@
 // The stand-in's keyboard and paste parser. Raw bytes in, messages out: each
 // bracketed paste is one message, each typed line confirmed with Enter is one
-// message, and an Enter on an empty line is a wake with no message. Keys that
+// message, and an Enter on an empty line is a wake with no message. Lines typed
+// before raw mode (the stand-in was still starting) are one message. Keys that
 // are not text (arrows, Ctrl-C, other escape sequences) are dropped, and
 // nothing typed or pasted is ever run.
 
@@ -74,7 +75,12 @@ export function createInput(emit: (event: InputEvent) => void, echo: (text: stri
       i += 1;
       if (c === "\r" || c === "\n") {
         if (c === "\r" && s[i] === "\n") i += 1;
-        if (line.trim()) { echo("\r\n"); emit({ message: line }); }
+        // An LF alone is a line typed into the cooked terminal before raw mode
+        // (there Enter became LF), or Ctrl-J: the message goes on, unless
+        // nothing follows it in this read. In raw mode Enter is CR.
+        if (c === "\n" && i < s.length) { line += "\n"; echo("\r\n"); continue; }
+        const text = line.replace(/^\n+|\n+$/g, "");
+        if (text.trim()) { echo("\r\n"); emit({ message: text }); }
         else emit({ enter: true });
         line = "";
       } else if (c === "\x7f" || c === "\b") {

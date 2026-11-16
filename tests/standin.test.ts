@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { standin, type System } from "../suspend/standin";
 
 // Fakes only at the boundary: the terminal, hc, the file system, the clock
@@ -11,18 +14,34 @@ const suspended = (root: "shell" | "agent", agent = "pi") => JSON.stringify({ ve
 const piLabels = (root: "shell" | "agent" = "agent") => ({ "herdr.suspended": suspended(root), "herdr.pi-recovery": PI_RECORD });
 const claudeLabels = (root: "shell" | "agent" = "agent") => ({ "herdr.suspended": suspended(root, "claude"), "herdr.claude-session": "claude-id" });
 
-type Options = { labels?: Record<string, string> | null; files?: Record<string, string>; env?: Record<string, string | undefined>; exec?: (argv: string[]) => string | null; hc?: (args: string[]) => { code: number; stdout: string } | undefined; saveFails?: boolean };
+const PROJECTS = "/home/me/.claude/projects";
+// Claude's transcripts: <id>.jsonl in a folder per project.
+const TRANSCRIPTS: Record<string, string[]> = { "-other": ["x.jsonl"], "-project": ["claude-id.jsonl", "abc.jsonl"] };
+
+type Options = { labels?: Record<string, string> | null; files?: Record<string, string>; env?: Record<string, string | undefined>; exec?: (argv: string[]) => string | null | Promise<string>; hc?: (args: string[]) => { code: number; stdout: string } | undefined; saveFails?: boolean; backgroundFails?: boolean; transcripts?: Record<string, string[]>; platform?: string };
 
 function fake(options: Options = {}) {
   const writes: string[] = [];
   const steps: string[] = [];
   const execs: string[][] = [];
+  const backgrounds: string[][] = [];
   const saved: Record<string, string> = {};
   const timers: { at: number; run: () => void }[] = [];
   let now = SINCE + 60_000;
   let onData: ((chunk: string) => void) | null = null;
+  let onError: ((error: unknown) => void) | null = null;
+  const transcripts = options.transcripts ?? TRANSCRIPTS;
   const sys: System = {
     env: { HOME: "/home/me", SHELL: "/bin/fish", ...options.env },
+    platform: options.platform ?? "linux",
+    unsetenv: (name) => { steps.push(`unsetenv ${name}`); delete sys.env[name]; },
+    list: async (dir) => (dir === PROJECTS ? Object.keys(transcripts) : []),
+    background: async (argv) => {
+      steps.push(`background ${argv.slice(4).join(" ")}`);
+      backgrounds.push(argv);
+      if (options.backgroundFails) throw new Error("fork failed");
+    },
+    onError: (handler) => { onError = handler; },
     write: (text) => { writes.push(text); },
     listen: (handler) => { onData = handler; },
     raw: (on) => { steps.push(`raw ${on}`); },
@@ -33,7 +52,12 @@ function fake(options: Options = {}) {
       if (args[0] === "get") return options.labels === null ? { code: 3, stdout: "" } : { code: 0, stdout: JSON.stringify({ address: args[1], labels: options.labels ?? piLabels() }) };
       return { code: 0, stdout: "{}" };
     },
-    readHead: async (path) => options.files && path in options.files ? options.files[path] ?? null : (path === SESSION_FILE ? '{"type":"session","id":"pi-id"}\n{"type":"message"}' : null),
+    readHead: async (path) => {
+      if (options.files && path in options.files) return options.files[path] ?? null;
+      if (path === SESSION_FILE) return '{"type":"session","id":"pi-id"}\n{"type":"message"}';
+      const [folder, file] = path.startsWith(`${PROJECTS}/`) ? path.slice(PROJECTS.length + 1).split("/") : [];
+      return transcripts[folder]?.includes(file) ? '{"type":"summary"}' : null;
+    },
     save: async (path, text) => { if (options.saveFails) throw new Error("read-only file system"); steps.push(`save ${path}`); saved[path] = text; },
     chdir: (path) => { steps.push(`chdir ${path}`); return null; },
     exec: (argv) => {
@@ -47,7 +71,8 @@ function fake(options: Options = {}) {
   };
   const settle = async () => { for (let i = 0; i < 50; i++) await Promise.resolve(); };
   return {
-    sys, writes, steps, execs, saved,
+    sys, writes, steps, execs, saved, backgrounds,
+    async fail(error: unknown) { onError!(error); await settle(); },
     screen: () => writes.join(""),
     // The handover never returns, as a real exec never does: do not wait for it.
     async start(args = ["pi", "t7", "worker"]) { void standin(args, sys); await settle(); },
@@ -98,6 +123,21 @@ describe("start", () => {
     const t = fake({ labels: {}, env: { SHELL: undefined } });
     await t.start();
     expect(t.execs).toEqual([["/bin/sh"]]);
+  });
+
+  test("the handover passes its shell arguments on", async () => {
+    const t = fake({ labels: {}, platform: "darwin" });
+    await t.start(["pi", "t7", "worker", "-l", "two words"]);
+    expect(t.execs).toEqual([["/bin/fish", "-l", "two words"]]);
+  });
+
+  test("on macOS, with no shell arguments, the handover starts a login shell, as hc does", async () => {
+    const mac = fake({ labels: {}, platform: "darwin" });
+    await mac.start();
+    expect(mac.execs).toEqual([["/bin/fish", "-l"]]);
+    const linux = fake({ labels: {}, platform: "linux" });
+    await linux.start();
+    expect(linux.execs).toEqual([["/bin/fish"]]);
   });
 
   test("retries hc while the core restarts, and never starts a shell when hc fails", async () => {
@@ -158,12 +198,67 @@ describe("input", () => {
     expect(t.execs).toEqual([PI_WAKE]);
   });
 
+  test("lines typed into the cooked terminal before raw mode (one read, LF endings) are one message", async () => {
+    const t = fake();
+    await t.start();
+    await t.input("first line\nsecond line\n");
+    await t.tick(500);
+    expect(t.execs).toEqual([[...PI_WAKE, "--", "first line\nsecond line"]]);
+  });
+
+  test("cooked lines whose Enter arrives after raw mode are still one message", async () => {
+    const t = fake();
+    await t.start();
+    await t.input("one\ntwo");
+    await t.input("\r");
+    await t.tick(500);
+    expect(t.execs).toEqual([[...PI_WAKE, "--", "one\ntwo"]]);
+  });
+
+  test("an Enter pressed before raw mode (a lone LF) is an empty wake", async () => {
+    const t = fake();
+    await t.start();
+    await t.input("\n");
+    await t.tick(500);
+    expect(t.execs).toEqual([PI_WAKE]);
+  });
+
   test("input is never run before the agent wakes", async () => {
     const t = fake();
     await t.start();
     await t.input(paste("rm -rf ~"));
     await t.input("echo hi\r");
     expect(t.execs).toEqual([]);
+  });
+});
+
+describe("lines kept by herdr-shell", () => {
+  const PENDING = { HERDR_STANDIN_PENDING: "kept line one\nkept line two" };
+
+  test("are one message of the next wake, and the variable is gone before any replacement", async () => {
+    const t = fake({ env: PENDING });
+    await t.start();
+    expect(t.steps[0]).toBe("unsetenv HERDR_STANDIN_PENDING");
+    await t.tick(200);
+    await t.input(paste("and a send"));
+    await t.tick(300);
+    expect(t.execs).toEqual([[...PI_WAKE, "--", "kept line one\nkept line two\n\nand a send"]]);
+  });
+
+  test("are saved when the session is missing", async () => {
+    const t = fake({ env: PENDING, labels: { "herdr.suspended": suspended("agent", "claude") } });
+    await t.start(["claude", "t3", "worker"]);
+    await t.tick(500);
+    expect(Object.values(t.saved)).toEqual(["kept line one\nkept line two"]);
+  });
+
+  test("are dropped with a note, never run, when the terminal is not suspended", async () => {
+    const t = fake({ env: PENDING, labels: {} });
+    await t.start();
+    expect(t.execs).toEqual([["/bin/fish"]]);
+    expect(t.steps.indexOf("unsetenv HERDR_STANDIN_PENDING")).toBeLessThan(t.steps.indexOf("exec /bin/fish"));
+    expect(t.screen()).toContain("dropped");
+    expect(t.screen()).not.toContain("kept line");
   });
 });
 
@@ -234,7 +329,7 @@ describe("wake", () => {
     await t.tick(500);
     expect(t.execs).toEqual([[...PI_WAKE, "--", "-starts with a dash"]]);
     const wake = t.steps.slice(t.steps.indexOf("chdir /project"));
-    expect(wake).toEqual(["chdir /project", "hc label t7 herdr.suspended=", "raw false", "exec pi"]);
+    expect(wake).toEqual(["chdir /project", "hc label t7 herdr.suspended=", "background t7 30", "raw false", "exec pi"]);
     expect(t.screen().lastIndexOf("\x1b[?2004l")).toBeGreaterThan(t.screen().lastIndexOf("\x1b[?2004h"));
   });
 
@@ -252,6 +347,21 @@ describe("wake", () => {
     // The script runs the words it is given, then the user's shell.
     const run = Bun.spawnSync(["/bin/sh", "-c", script, name, "printf", "%s|", "a b", "--", "it's\nmultiline"], { env: { SHELL: "/bin/echo" } });
     expect(run.stdout.toString()).toBe("a b|--|it's\nmultiline|\n");
+  });
+
+  test("root=shell: the shell after the agent gets the shell arguments, or -l on macOS", async () => {
+    const tail = async (options: Options, args: string[]) => {
+      const t = fake({ labels: claudeLabels("shell"), ...options });
+      await t.start(["claude", "t9", "worker", ...args]);
+      await t.input("\r");
+      await t.tick(500);
+      const [, , script, name] = t.execs[0];
+      const run = Bun.spawnSync(["/bin/sh", "-c", script, name, "true"], { env: { SHELL: "/bin/echo" } });
+      return run.stdout.toString();
+    };
+    expect(await tail({ platform: "linux" }, ["-i", "it's"])).toBe("-i it's\n");
+    expect(await tail({ platform: "darwin" }, [])).toBe("-l\n");
+    expect(await tail({ platform: "linux" }, [])).toBe("\n");
   });
 
   test("Claude wakes from its recorded session id, in the record's folder", async () => {
@@ -283,6 +393,156 @@ describe("wake", () => {
   });
 });
 
+describe("failed wakes and errors", () => {
+  test("every failed wake that reported working, empty or not, reports blocked again", async () => {
+    const t = fake({ exec: () => "No such file or directory" });
+    await t.start();
+    for (let i = 0; i < 2; i++) { await t.input("\r"); await t.tick(500); }
+    expect(reports(t.screen())).toEqual(["idle", "working", "blocked", "working", "blocked"]);
+  });
+
+  test("a wake that fails after its working report (folder, label) ends blocked", async () => {
+    const t = fake({ hc: (args) => (args[0] === "label" ? { code: 3, stdout: "" } : undefined) });
+    await t.start();
+    await t.input("\r");
+    await t.tick(500);
+    await t.input("\r");
+    await t.tick(500);
+    expect(reports(t.screen())).toEqual(["idle", "working", "blocked", "working", "blocked"]);
+    expect(t.execs).toEqual([]);
+  });
+
+  test("a rejected replacement puts the label back, keeps the messages and reports blocked", async () => {
+    const t = fake({ exec: () => Promise.reject(new Error("ffi broke")) });
+    await t.start();
+    await t.input(paste("keep me"));
+    await t.tick(500);
+    expect(t.steps).toContain(`hc label t7 herdr.suspended=${suspended("agent")}`);
+    expect(t.steps.lastIndexOf("raw true")).toBeGreaterThan(t.steps.lastIndexOf("raw false"));
+    expect(Object.values(t.saved)).toEqual(["keep me"]);
+    expect(reports(t.screen()).at(-1)).toBe("blocked");
+    expect(t.screen()).toContain("ffi broke");
+  });
+
+  test("an error inside the wake takes the missing-session path, and the stand-in still wakes later", async () => {
+    let first = true;
+    const t = fake({ files: {} });
+    t.sys.readHead = async () => { if (first) { first = false; throw new Error("disk gone"); } return '{"type":"session","id":"pi-id"}'; };
+    await t.start();
+    await t.input(paste("one"));
+    await t.tick(500);
+    expect(Object.values(t.saved)).toEqual(["one"]);
+    expect(t.screen()).toContain("disk gone");
+    expect(reports(t.screen()).at(-1)).toBe("blocked");
+    await t.input(paste("two"));
+    await t.tick(500);
+    expect(t.execs).toEqual([[...PI_WAKE, "--", "two"]]);
+  });
+
+  test("an unexpected error keeps the collected messages, reports blocked, and input still works", async () => {
+    const t = fake();
+    await t.start();
+    await t.input(paste("held"));
+    await t.fail(new Error("boom"));
+    expect(Object.values(t.saved)).toEqual(["held"]);
+    expect(t.screen()).toContain("boom");
+    expect(reports(t.screen()).at(-1)).toBe("blocked");
+    await t.tick(500);
+    expect(t.execs).toEqual([]);
+    await t.input(paste("again"));
+    await t.tick(500);
+    expect(t.execs).toEqual([[...PI_WAKE, "--", "again"]]);
+  });
+
+  test("an error while reading the terminal at start holds the terminal, blocked, and keeps typed messages", async () => {
+    const t = fake({ env: { XDG_STATE_HOME: "/state" } });
+    t.sys.hc = async () => { throw new Error("spawn failed"); };
+    await t.start();
+    expect(t.execs).toEqual([]);
+    expect(reports(t.screen())).toEqual(["blocked"]);
+    await t.input(paste("hello"));
+    await t.tick(500);
+    expect(Object.values(t.saved)).toEqual(["hello"]);
+  });
+});
+
+describe("watchdog", () => {
+  // The watchdog the stand-in started, run for real with a fake hc on PATH
+  // and no wait. It returns what it wrote to the terminal and the hc calls.
+  async function watchdog(argv: string[], answer: { code: number; json?: unknown }) {
+    const dir = mkdtempSync(join(tmpdir(), "standin-watchdog-"));
+    try {
+      writeFileSync(join(dir, "answer"), answer.json === undefined ? "" : JSON.stringify(answer.json));
+      writeFileSync(join(dir, "hc"), `#!/bin/sh\nprintf '%s\\n' "$*" >> "${dir}/calls"\ncat "${dir}/answer"\nexit ${answer.code}\n`, { mode: 0o755 });
+      const run = Bun.spawn([...argv.slice(0, -1), "0"], { env: { PATH: `${dir}:/usr/bin:/bin` }, stdout: "pipe", stderr: "pipe" });
+      const written = await new Response(run.stdout).text(); // the end comes when the background part ends
+      await run.exited;
+      let calls: string[] = [];
+      try { calls = readFileSync(join(dir, "calls"), "utf8").trim().split("\n"); } catch { /* none */ }
+      return { written, calls };
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+  const started = async () => {
+    const t = fake();
+    await t.start();
+    await t.input(paste("hi"));
+    await t.tick(500);
+    expect(t.backgrounds).toHaveLength(1);
+    return t.backgrounds[0];
+  };
+  const terminal = (status: unknown, foreground: unknown, statusMs = Date.now() - 60_000) => ({
+    address: "t7", argv: ["/x/herdr-shell"], foreground, labels: { note: "\"app\":\"herdr-standin\"" }, name: "worker", pid: 11, state: "live", status, status_ms: statusMs,
+  });
+  const STANDIN_REPORT = { app: "herdr-standin", state: "working" };
+  const AGENT_FRONT = { argv: ["pi", "", ""], cwd: "/project", name: "node", pid: 11 };
+  const IDLE = "\x1b]7501;state=idle\x1b\\";
+
+  test("the wake starts it with /bin/sh for its terminal and 30 s, before the replacement", async () => {
+    const argv = await started();
+    expect(argv.slice(0, 2)).toEqual(["/bin/sh", "-c"]);
+    expect(argv.slice(4)).toEqual(["t7", "30"]);
+  });
+
+  test("a wake that cannot start it still wakes the agent", async () => {
+    const t = fake({ backgroundFails: true });
+    await t.start();
+    await t.input(paste("hi"));
+    await t.tick(500);
+    expect(t.execs).toEqual([[...PI_WAKE, "--", "hi"]]);
+  });
+
+  test("a wake that fails before the replacement starts none", async () => {
+    const t = fake({ labels: { "herdr.suspended": suspended("agent", "claude") } });
+    await t.start(["claude", "t3", "worker"]);
+    await t.input("\r");
+    await t.tick(500);
+    expect(t.backgrounds).toEqual([]);
+  });
+
+  test("writes one idle report with no app when the stand-in's report is stale and the stand-in is not in front", async () => {
+    const result = await watchdog(await started(), { code: 0, json: terminal(STANDIN_REPORT, AGENT_FRONT) });
+    expect(result.calls).toEqual(["get t7 --json"]);
+    expect(result.written).toBe(IDLE);
+  });
+
+  for (const [name, answer] of [
+    ["the stand-in is in front (its path)", { code: 0, json: terminal(STANDIN_REPORT, { argv: ["/bin dir/herdr-standin", "pi", "t7", "worker"], cwd: "/", name: "herdr-standin", pid: 11 }) }],
+    ["the stand-in is in front (its name only)", { code: 0, json: terminal(STANDIN_REPORT, { argv: ["x"], cwd: "/", name: "herdr-standin", pid: 11 }) }],
+    ["the stand-in is in front (a bare argv)", { code: 0, json: terminal(STANDIN_REPORT, { argv: ["herdr-standin"], cwd: "/", name: "bun", pid: 11 }) }],
+    ["the woken agent reported", { code: 0, json: terminal({ app: "pi", state: "idle" }, AGENT_FRONT) }],
+    ["nothing reports", { code: 0, json: terminal(null, AGENT_FRONT) }],
+    ["a later wake reported after it started", { code: 0, json: terminal(STANDIN_REPORT, AGENT_FRONT, Date.now() + 120_000) }],
+    ["hc gives no report time", { code: 0, json: { ...terminal(STANDIN_REPORT, AGENT_FRONT), status_ms: null } }],
+    ["hc fails", { code: 3, json: { error: { kind: "not_found" } } }],
+  ] as [string, { code: number; json: unknown }][]) {
+    test(`writes nothing when ${name}`, async () => {
+      const result = await watchdog(await started(), answer);
+      expect(result.calls).toEqual(["get t7 --json"]);
+      expect(result.written).toBe("");
+    });
+  }
+});
+
 describe("missing session", () => {
   const missing = async (options: Options, args = ["pi", "t1/x", "worker"]) => {
     const t = fake({ env: { XDG_STATE_HOME: "/state" }, ...options });
@@ -299,6 +559,9 @@ describe("missing session", () => {
     ["the Pi record has no session file", { labels: { "herdr.suspended": suspended("agent"), "herdr.pi-recovery": JSON.stringify({ version: 1, sessionId: "pi-id", cwd: "/r", args: [] }) } }],
     ["there is no Pi record", { labels: { "herdr.suspended": suspended("agent") } }],
     ["Claude has no session id", { labels: { "herdr.suspended": suspended("agent", "claude") } }],
+    ["Claude's session has no transcript", { labels: claudeLabels(), transcripts: { "-project": ["another.jsonl"] } }],
+    ["Claude has no projects folder", { labels: claudeLabels(), transcripts: {} }],
+    ["Claude's session id is a path", { labels: { ...claudeLabels(), "herdr.claude-session": "../-project/claude-id" } }],
   ] as [string, Options][]) {
     test(`${name}: messages saved, path shown, blocked reported, no wake`, async () => {
       const t = await missing(options);
