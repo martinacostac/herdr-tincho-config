@@ -12,12 +12,24 @@ The facts:
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+Status: done
 
-- [ ] Each of F1–F5 has a recorded answer and the evidence (commands run and what they returned) in the plan
-- [ ] Every check ran against a disposable core; no live terminal or real session was touched
-- [ ] F2 records the Claude argv shapes seen and whether the first prompt after `--` is submitted
-- [ ] F3 records which signal gives a loss for a shell main program, and whether the hosted agent saved its session
-- [ ] F4 records the error kind and text to retry on
-- [ ] F5 records the report syntax for each state and how the three coordination commands treated the probe
-- [ ] Any contradiction with the spec is listed with the decision it affects
+- [x] Each of F1–F5 has a recorded answer and the evidence (commands run and what they returned) in the plan
+- [x] Every check ran against a disposable core; no live terminal or real session was touched
+- [x] F2 records the Claude argv shapes seen and whether the first prompt after `--` is submitted
+- [x] F3 records which signal gives a loss for a shell main program, and whether the hosted agent saved its session
+- [x] F4 records the error kind and text to retry on
+- [x] F5 records the report syntax for each state and how the three coordination commands treated the probe
+- [x] Any contradiction with the spec is listed with the decision it affects
+
+## Comments
+
+The answers and the evidence are in the plan, in "Open facts: answers" (commit 3ebef3e). All checks ran on a disposable core (`HC_SESSION=f1`, XDG paths under `/tmp/hcf`). That includes F3 and F5. The real core only hosted throwaway `--rm` runner terminals, and its pid and uptime did not change.
+
+- F1: kept terminals keep their address and labels through stop and start.
+- F2: Claude's argv is fully visible, prompt included. `--resume <id> -- msg` submits the message, also when it starts with `-` or has several lines. The variadic `--add-dir` and the other variadic options swallow a trailing prompt (a note for ticket 03).
+- F3: SIGTERM to fish is a loss. Claude and Pi exit cleanly with their sessions saved.
+- F4: `hc get` waits for a starting core and starts a stopped one. Retry only on exit 5 / `unavailable`.
+- F5: the syntax is `ESC]7501;state=…[:app=…][:kind=…][:msg=<b64>]ESC\`. An `idle` probe works with `send --if idle`, `wait` and `send --wait`.
+
+No contradiction with the spec. Not verified: whether a first-run Claude dialog shown during a wake drops the first prompt.
