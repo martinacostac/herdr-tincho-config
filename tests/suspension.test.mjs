@@ -347,6 +347,16 @@ test("a copy leads only once its own entry is published, and a stale or closed l
   assert.equal(b.leading(later), true);
 });
 
+test("a copy whose entry another copy's write dropped writes it again on its next render", async () => {
+  resetCopies();
+  const a = copy("a");
+  await render(a, "one", NOW);
+  store.set(policy.SUSPEND_WINDOWS, {});
+  assert.equal(a.leading(NOW), false);
+  await render(a, "one", NOW + 10);
+  assert.equal(a.leading(NOW + 10), true);
+});
+
 test("a terminal focused in another window is never suspended", async () => {
   resetCopies();
   windows.two = { ...windows.one, tab: "tab-7", pane: "pane-7", terminal: "t7" };
@@ -635,17 +645,17 @@ test("the leader shares each local agent's current reason, automatic and manual"
   appSettings = { "tincho.suspend": false };
   await a.pass(NOW + 15_000);
   assert.deepEqual(state().agents.t7, { auto: "off", manual: null });
-  // The installation is checked again every 10 minutes while no agent qualifies.
-  makeHome({ shell: false });
+  // The installation is checked when an agent is past its threshold.
+  makeHome({ standin: false });
   await a.pass(NOW + 30_000);
   assert.deepEqual(state().agents.t7, { auto: "off", manual: null });
-  await a.pass(NOW + 11 * MINUTE);
-  assert.deepEqual(state().agents.t7, { auto: "off", manual: "not-installed" });
   appSettings = {};
-  makeHome();
-  makeHome({ standin: false });
-  await a.pass(NOW + 11 * MINUTE + 15_000);
+  await a.pass(NOW + 45_000);
   assert.deepEqual(state().agents.t7, { auto: "not-installed", manual: "not-installed" });
+  // That check holds for the reasons until the next one.
+  appSettings = { "tincho.suspend": false };
+  await a.pass(NOW + 60_000);
+  assert.deepEqual(state().agents.t7, { auto: "off", manual: "not-installed" });
   assert.deepEqual(suspendedAddresses(), []);
 });
 
@@ -654,9 +664,8 @@ test("a pass starts no process while no agent is past its threshold", async () =
   appSettings = { "tincho.suspend": { after_minutes: 120 } };
   const a = copy("a");
   await render(a, "one", NOW);
-  await a.pass(NOW);
   const runs = shRuns;
-  for (let i = 1; i <= 20; i++) await a.pass(NOW + i * 15_000);
+  for (let i = 0; i <= 20; i++) await a.pass(NOW + i * 15_000);
   assert.deepEqual(calls, []);
   assert.equal(shRuns, runs);
 });

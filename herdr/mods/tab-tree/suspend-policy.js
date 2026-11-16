@@ -11,6 +11,11 @@ import { isClaude } from "./claude-polling.js";
 
 export const NEVER_SUSPEND = "herdr.never-suspend";
 
+// Remote addresses carry their machine: mini/t7. Suspension acts only on
+// this machine's core.
+/** @param {string} address */
+const remote = (address) => address.includes("/");
+
 /** @param {unknown} s */
 const printable = (s) => typeof s === "string" && s.length > 0 && !/[\x00-\x1f\x7f]/.test(s);
 
@@ -73,8 +78,7 @@ const statusOf = (t) => typeof t?.status === "string" ? t.status : t?.status?.st
 export async function unusedAgent(terminal, { now = Date.now(), focusedAt = null, manual = false, focusedTerminals = null, checkProcesses = true } = {}) {
   const config = suspendSettings();
   if (!manual && !config.auto) return { unused: false, reason: "off" };
-  // Suspension acts only on this machine's core (remote addresses: machine/t7).
-  if (typeof terminal.address !== "string" || terminal.address.includes("/")) return { unused: false, reason: "remote" };
+  if (typeof terminal.address !== "string" || remote(terminal.address)) return { unused: false, reason: "remote" };
   const labels = terminal.labels ?? {};
   if (Object.hasOwn(labels, SUSPENDED)) return { unused: false, reason: "suspended" };
   const agent = agentOf(terminal);
@@ -267,7 +271,8 @@ const idleStandin = (t) => Object.hasOwn(t?.labels ?? {}, SUSPENDED) &&
 //   attempt (and in results). results: the outcome of the latest request for
 //   each terminal (requested is the request's value), kept for RESULT_MS.
 // A reason is an Outcome: a rule from unusedAgent(), or "not-installed" (the
-// stand-in or herdr-shell is missing, or herdr-shell is not hc's shell),
+// stand-in or herdr-shell is missing, or herdr-shell is not hc's shell; in
+// agents only after a pass had an agent past its threshold),
 // "gone" (the terminal ended), "changed" (its status, turn or program changed
 // during the steps), "failed" (an hc command or the signal failed), or
 // "closed" (the mod closed).
@@ -275,10 +280,7 @@ export const SUSPEND_REQUESTS = "tincho.suspend.requests";
 export const SUSPEND_STATE = "tincho.suspend.state";
 const REQUEST_MS = 60_000;
 const RESULT_MS = 10 * 60_000;
-// How often the pass checks the installation while no agent qualifies (so
-// the shared reasons can say "not-installed").
-const INSTALL_CHECK_MS = 10 * 60_000;
-// After a process check kept an agent (background processes), the pass reads
+// After the process rule refused an agent (background processes), the pass reads
 // the process table for it again only after this long.
 const PROCESS_RETRY_MS = 5 * 60_000;
 
@@ -294,8 +296,11 @@ function currentState() {
   return { agents: record(value.agents), results: record(value.results) };
 }
 
-/** @param {Verdict} verdict @returns {Reason | null} */
-const reasonOf = (verdict) => "reason" in verdict ? verdict.reason : null;
+/** @typedef {{ suspended: true } | { suspended: false, reason: Outcome }} SuspendOutcome */
+
+// The reason of a verdict or of a suspension's outcome, null when it passed.
+/** @param {Verdict | SuspendOutcome} result @returns {Outcome | null} */
+const reasonOf = (result) => "reason" in result ? result.reason : null;
 
 /** @returns {Record<string, WindowEntry>} */
 const windowEntries = () => record(shared(SUSPEND_WINDOWS));
@@ -303,8 +308,11 @@ const windowEntries = () => record(shared(SUSPEND_WINDOWS));
 /** @param {unknown} entry @param {number} now @returns {entry is WindowEntry} */
 const fresh = (entry, now) => Number.isFinite(/** @type {any} */ (entry)?.at) && now - /** @type {any} */ (entry).at < STALE_MS;
 
+/** @param {string} address @returns {Record<string, any> | undefined} */
+const terminalAt = (address) => terminals().find((t) => t?.address === address);
+
 /** @param {Record<string, any>} t */
-const localAgent = (t) => typeof t?.address === "string" && !t.address.includes("/") && Boolean(t.program?.agent || t.report);
+const localAgent = (t) => typeof t?.address === "string" && !remote(t.address) && Boolean(t.program?.agent || t.report);
 
 /** @typedef {(ms: number, run: () => unknown) => { cancel(): void }} Schedule */
 
@@ -336,10 +344,9 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
   /** @type {Map<string, { since: number, timer: { cancel(): void } | null }>} */
   const wakes = new Map(); // focused suspended terminal -> its focus's wake timer (null once fired)
   /** @type {boolean | null} */
-  let installed = null;
-  let installCheckedAt = -Infinity;
+  let installed = null; // from the last pass that had an agent past its threshold
   /** @type {Map<string, { key: string, reason: Outcome, at: number }>} */
-  const kept = new Map(); // terminal -> the process rule that kept it, for which process
+  const heldBack = new Map(); // terminal -> the process rule that refused it last, for which process
   // Suspensions run one at a time.
   let queue = Promise.resolve();
   /** @template T @param {() => Promise<T>} job @returns {Promise<T>} */
@@ -366,6 +373,9 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
     return changed;
   }
 
+  // Reads the entries, replaces its own and drops stale ones, with no await
+  // in between: the copies share one script runtime (resume.js), so no other
+  // copy writes in the middle. observe() repairs an entry that a write lost.
   /** @param {number} now */
   function publish(now) {
     focusChanged = false;
@@ -415,14 +425,11 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
     const targets = new Map();
     const { focused } = focusView(now);
     if (!focused.size) return targets;
-    const all = terminals();
-    for (const [address, at] of focused) {
-      if (!address.includes("/") && idleStandin(all.find((t) => t?.address === address))) targets.set(address, at);
-    }
+    for (const [address, at] of focused) if (!remote(address) && idleStandin(terminalAt(address))) targets.set(address, at);
     return targets;
   }
 
-  // Whether a request in SUSPEND_REQUESTS waits for the leader.
+  // The requests in SUSPEND_REQUESTS that wait for this copy: [address, requested].
   /** @param {number} now @returns {[string, number][]} */
   function newRequests(now) {
     const requests = Object.entries(record(shared(SUSPEND_REQUESTS)));
@@ -438,6 +445,8 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
   function observe(now = clock()) {
     if (closed) return false;
     if (track(now)) focusChanged = true;
+    // Another copy's write dropped this copy's entry: write it again.
+    if (published > -Infinity && !Object.hasOwn(windowEntries(), id)) focusChanged = true;
     let work = focusChanged;
     if (!work && leading(now)) {
       const targets = wakeTargets(now);
@@ -479,7 +488,7 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
         const outcome = await suspend(address, { now, manual: true });
         if (closed) return;
         /** @type {RequestResult} */
-        const result = { requested, suspended: outcome.suspended, reason: "reason" in outcome ? outcome.reason : null, at: now };
+        const result = { requested, suspended: outcome.suspended, reason: reasonOf(outcome), at: now };
         writeState((state) => ({ results: { ...state.results, [address]: result } }), now);
       }).finally(() => requesting.delete(address));
     }));
@@ -517,7 +526,7 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
   /**
    * @param {string} address
    * @param {{ now?: number, manual?: boolean }} [options]
-   * @returns {Promise<{ suspended: true } | { suspended: false, reason: Outcome }>}
+   * @returns {Promise<SuspendOutcome>}
    */
   async function suspend(address, { now = clock(), manual = false } = {}) {
     /** @param {Outcome} reason */
@@ -535,8 +544,8 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
     if (!Number.isSafeInteger(pid) || pid <= 0) return abort("processes-unknown");
     // A shell hosts the agent when the main program is not the agent itself.
     const root = pid === before.foreground?.pid ? "agent" : "shell";
-    const record = suspension(JSON.stringify({ version: 1, agent: verdict.agent, root, cwd: before.foreground?.cwd, since: now }));
-    if (!record) return abort("not-resumable");
+    const label = suspension(JSON.stringify({ version: 1, agent: verdict.agent, root, cwd: before.foreground?.cwd, since: now }));
+    if (!label) return abort("not-resumable");
     // 2. Keep the terminal, so the signal leaves it live.
     if (!await succeeds(hc(["keep", address]))) return abort("failed");
     if (closed) return abort("closed");
@@ -547,7 +556,7 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
     if (statusOf(after) !== statusOf(before) || after.turn !== before.turn || after.pid !== pid ||
         after.foreground?.pid !== before.foreground?.pid) return abort("changed");
     // 4. The record herdr-shell and the stand-in read.
-    if (!await succeeds(hc(["label", address, `${SUSPENDED}=${JSON.stringify(record)}`]))) return abort("failed");
+    if (!await succeeds(hc(["label", address, `${SUSPENDED}=${JSON.stringify(label)}`]))) return abort("failed");
     if (closed) return abort("closed");
     // 5. End the main program: hc starts herdr-shell, which starts the stand-in.
     if (!await succeeds(exec("kill", [`-${SIGNAL}`, String(pid)]))) return abort("failed");
@@ -560,8 +569,8 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
 
   // Every 15 s: the heartbeat, then the leader shares each local agent's
   // reasons and suspends the unused agents one at a time. Without an agent
-  // past its threshold it starts no process (except an installation check
-  // every INSTALL_CHECK_MS).
+  // past its threshold it starts no process: the installation is checked
+  // only then, so "not-installed" shows in the reasons from that check on.
   /** @param {number} [now] */
   async function pass(now = clock()) {
     if (closed) return;
@@ -584,21 +593,20 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
         /** @type {Outcome | null} */
         let automatic = auto ? reasonOf(await unusedAgent(terminal, input)) : "off";
         if (closed) return;
-        const previous = kept.get(address);
-        if (previous && previous.key !== processKey(terminal)) kept.delete(address);
-        const keptBy = kept.get(address);
-        if (keptBy) {
-          manual ??= keptBy.reason;
+        const previous = heldBack.get(address);
+        if (previous && previous.key !== processKey(terminal)) heldBack.delete(address);
+        const held = heldBack.get(address);
+        if (held) {
+          manual ??= held.reason;
           // Read its processes again only after a while.
-          if (automatic === null && now - keptBy.at < PROCESS_RETRY_MS) automatic = keptBy.reason;
+          if (automatic === null && now - held.at < PROCESS_RETRY_MS) automatic = held.reason;
         }
         agents[address] = { auto: automatic, manual };
         if (automatic === null) candidates.push(address);
       }
-      for (const address of kept.keys()) if (!Object.hasOwn(agents, address)) kept.delete(address);
-      if (candidates.length || now - installCheckedAt >= INSTALL_CHECK_MS) {
+      for (const address of heldBack.keys()) if (!Object.hasOwn(agents, address)) heldBack.delete(address);
+      if (candidates.length) {
         installed = await suspensionInstalled();
-        installCheckedAt = now;
         if (closed) return;
       }
       if (installed === false) {
@@ -612,10 +620,10 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
       for (const address of candidates) {
         if (closed || !leading(now)) return;
         const outcome = await serial(() => suspend(address, { now }));
-        const terminal = terminals().find((t) => t?.address === address);
-        const reason = "reason" in outcome ? outcome.reason : null;
+        const terminal = terminalAt(address);
+        const reason = reasonOf(outcome);
         if ((reason === "background" || reason === "processes-unknown") && terminal) {
-          kept.set(address, { key: processKey(terminal), reason, at: now });
+          heldBack.set(address, { key: processKey(terminal), reason, at: now });
         }
       }
     } finally {

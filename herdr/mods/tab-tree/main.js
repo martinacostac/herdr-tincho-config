@@ -98,35 +98,16 @@ export default class TabTree extends View {
     cx.timer.every(10000, (cx) => this.rememberSessions(cx));
     // One policy per copy; only the leading copy acts (several windows can
     // show tab-tree at once). Focus and manual requests are observed in
-    // render; the 15 s pass is the only periodic work.
+    // render; the 15 s pass is the only periodic work (it never overlaps
+    // itself).
     this.suspender = createSuspender();
-    this.suspendPassing = false;
-    cx.timer.every(15000, (cx) => this.suspendPass(cx));
+    cx.timer.every(15000, (cx) => cx.spawn(() => this.suspender.pass()));
     this.refresh(cx);
   }
 
   close() {
     this.recovery.close();
     this.suspender.close();
-  }
-
-  // The policy's heartbeat, shared reasons and automatic suspension, never
-  // two at once.
-  suspendPass(cx) {
-    if (this.suspendPassing) return;
-    this.suspendPassing = true;
-    try {
-      cx.spawn(async () => {
-        try {
-          await this.suspender.pass();
-        } finally {
-          this.suspendPassing = false;
-        }
-      });
-    } catch (error) {
-      this.suspendPassing = false;
-      throw error;
-    }
   }
 
   // From render: the policy records the focus and the manual requests; what
