@@ -35,7 +35,9 @@ function agentOf(t) {
 /** @type {Record<"claude" | "pi", (labels: Record<string, string>) => boolean>} */
 const RESUMABLE = {
   claude: (labels) => printable(labels[SESSION]),
-  pi: (labels) => piRecovery(labels[PI_RECOVERY]) !== null,
+  // An ID-only record (no session file) is refused by the stand-in's wake,
+  // so suspending it would only leave a blocked stand-in.
+  pi: (labels) => Boolean(piRecovery(labels[PI_RECOVERY])?.sessionFile),
 };
 
 // The terminals being looked at in this copy's window: the one with the

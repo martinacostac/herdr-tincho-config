@@ -101,6 +101,8 @@ test("an agent that cannot be started again from its session is not resumable", 
     claude({ labels: { [LABEL]: "claude", [PI_RECOVERY]: piRecord } }),
     pi({ labels: { [LABEL]: "pi" } }),
     pi({ labels: { [LABEL]: "pi", [PI_RECOVERY]: "not json" } }),
+    // An ID-only record (no session file): the stand-in refuses to wake it.
+    pi({ labels: { [LABEL]: "pi", [PI_RECOVERY]: JSON.stringify({ version: 1, sessionId: "session-1", cwd: "/project", args: [] }) } }),
     pi({ labels: { [LABEL]: "pi", [SESSION]: "claude-session" } }),
     pi({ program: { key: "codex", agent: true, shell: false }, report: { app: "codex", state: "idle" }, labels: { [SESSION]: "s", [PI_RECOVERY]: piRecord } }),
     pi({ program: { key: "shell", agent: false, shell: true }, report: null, status: null }),

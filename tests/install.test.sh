@@ -4,6 +4,9 @@ set -eu
 
 project=$(cd "$(dirname "$0")/.." && pwd)
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/herdr-install-test.XXXXXX")
+# macOS's TMPDIR ends in a slash. pwd drops the doubled one, as the installer's
+# own paths do, so the expected paths match what it writes.
+scratch=$(cd "$scratch" && pwd)
 watch_pid=
 cleanup() {
   if [ -n "$watch_pid" ]; then
