@@ -14,7 +14,7 @@
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, panes, terminals, machines, run, openOverlay, theme, shared, setShared, exec, hc, home, layout } from "herdr";
-import { LABEL, SESSION, RECIPES, createRecovery, remember, claudeSession, rememberSession } from "./resume.js";
+import { LABEL, SESSION, RECIPES, createRecovery, remember, claudeLaunch, rememberClaudeLaunch } from "./resume.js";
 import { claudeCandidate, processIdentity } from "./claude-polling.js";
 
 function find(node, id) {
@@ -224,9 +224,9 @@ export default class TabTree extends View {
             const current = () => terminals().find((t) => t.address === address && claudeCandidate(t) && processIdentity(t) === identity);
             const before = current();
             if (!before) continue;
-            const found = await claudeSession(address, before).catch(() => null);
+            const found = await claudeLaunch(address, before).catch(() => null);
             const after = current();
-            if (found && after) await rememberSession(address, found, after.labels ?? {}).catch(() => null);
+            if (found && after) await rememberClaudeLaunch(address, found, after.labels ?? {}).catch(() => null);
           }
         } finally {
           this.sessionsBusy = false;

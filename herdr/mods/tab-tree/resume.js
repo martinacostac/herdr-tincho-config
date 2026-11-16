@@ -110,7 +110,7 @@ export function remember(address, agent) {
 // ~/.claude/sessions/<pid>.json for each running process (sessionId follows
 // /clear and /resume inside it). The options come from the argv of that same
 // process.
-export async function claudeSession(address, expected) {
+export async function claudeLaunch(address, expected) {
   const j = await info(address);
   const pid = j?.foreground?.pid;
   if (j?.state !== "live" || !isClaude(j) || !Number.isSafeInteger(pid) || pid <= 0) return null;
@@ -128,9 +128,9 @@ export async function claudeSession(address, expected) {
   return after?.state === "live" && isClaude(after) && processIdentity(after) === identity ? { id, options } : null;
 }
 
-// Writes what changed of a claudeSession result, in one label call: the
+// Writes what changed of a claudeLaunch result, in one label call: the
 // session, and the options (removed when the process has none).
-export async function rememberSession(address, { id, options }, labels = {}) {
+export async function rememberClaudeLaunch(address, { id, options }, labels = {}) {
   const changes = [];
   if (labels[SESSION] !== id) changes.push(`${SESSION}=${id}`);
   if ((labels[CLAUDE_OPTIONS] ?? null) !== options) changes.push(`${CLAUDE_OPTIONS}=${options ?? ""}`);

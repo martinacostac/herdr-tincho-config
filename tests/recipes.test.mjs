@@ -15,7 +15,7 @@ test("Claude never reads Pi's record", () => {
   assert.deepEqual(recipe("claude", pi(record)), { cwd: null, argv: ["claude", "--resume"] });
 });
 
-const options = (args, version = 1) => ({ [CLAUDE_OPTIONS]: JSON.stringify({ version, args }) });
+const options = (args, version = 1) => ({ [CLAUDE_OPTIONS]: JSON.stringify({ version, options: args }) });
 
 test("Claude starts with its launch options before --resume, so a resumed Claude records them again", () => {
   const labels = { [SESSION]: "claude-id", ...options(["--model", "haiku", "--add-dir", "/it's", "--verbose"]) };

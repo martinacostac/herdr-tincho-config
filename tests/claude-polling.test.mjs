@@ -256,7 +256,7 @@ test("a spawn failure cannot leave the poller busy", async () => {
   assert.equal(writes().length, 1);
 });
 
-const optionsLabel = (args) => JSON.stringify({ version: 1, args });
+const optionsLabel = (args) => JSON.stringify({ version: 1, options: args });
 const launched = (argv, extra = {}) => terminal("claude", { foreground: { pid: 11, cwd: "/work", argv }, ...extra });
 
 test("the launch options of the Claude process read are written in the same label call as its session", async () => {

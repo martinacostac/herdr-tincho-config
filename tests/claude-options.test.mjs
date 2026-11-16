@@ -59,6 +59,13 @@ test("prompts, system prompts, credentials and session selectors are dropped, an
   assert.doesNotMatch(JSON.stringify(kept), /secret|name|0b2e|token|beta|file|mcp|log|ccpool|box/i);
 });
 
+test("a kept option that only works with a dropped one is dropped too", () => {
+  assert.deepEqual(claudeOptions(["--strict-mcp-config", "--mcp-config", "/m.json", "--model", "opus", "--"]), ["--model", "opus"]);
+  assert.deepEqual(claudeOptions(["--agent", "rev", "--agents", '{"rev":{}}', "--verbose"]), ["--verbose"]);
+  assert.deepEqual(claudeOptions(["--settings", "/s.json", "--bare", "--verbose"]), ["--verbose"]);
+  assert.deepEqual(claudeOptions(["--strict-mcp-config", "--agent", "rev", "--bare", "--"]), ["--strict-mcp-config", "--agent", "rev", "--bare"]);
+});
+
 test("options with an optional value stop capture, so their value or a prompt is never taken as an option", () => {
   for (const stop of ["-r", "--resume", "-d", "--debug", "-w", "--worktree", "--remote-control", "--teleport", "--from-pr",
     "--cloud", "--prompt-suggestions", "--tmux", "--resume=abc", "--debug=hooks"]) {
@@ -91,7 +98,7 @@ test("the --name=value form is read like two words", () => {
 test("the label holds a versioned record of the options, and no label means no options", () => {
   assert.equal(CLAUDE_OPTIONS, "herdr.claude-options");
   const raw = claudeOptionsLabel(["--model", "haiku", "--add-dir", "lib", "--", "<prompt>"], "/work");
-  assert.deepEqual(JSON.parse(raw), { version: 1, args: ["--model", "haiku", "--add-dir", "/work/lib"] });
+  assert.deepEqual(JSON.parse(raw), { version: 1, options: ["--model", "haiku", "--add-dir", "/work/lib"] });
   assert.deepEqual(claudeOptionsRecord(raw), ["--model", "haiku", "--add-dir", "/work/lib"]);
   assert.equal(claudeOptionsLabel(["<prompt>"], "/work"), null);
   assert.equal(claudeOptionsLabel(["--resume", "id", "--model", "haiku"], "/work"), null);
@@ -99,9 +106,10 @@ test("the label holds a versioned record of the options, and no label means no o
 
 test("malformed, future-version and control-containing records are ignored", () => {
   for (const raw of [undefined, null, "", "null", "[]", "1", "not json", ...[
-    { version: 2, args: ["--model", "opus"] }, { version: "1", args: ["--model", "opus"] }, { args: ["--model", "opus"] },
-    { version: 1 }, { version: 1, args: "--model opus" }, { version: 1, args: [7] }, { version: 1, args: {} },
-    { version: 1, args: ["--model", "op\nus"] }, { version: 1, args: ["--model", "op\x1bus"] }, { version: 1, args: ["--model\x7f", "opus"] },
+    { version: 2, options: ["--model", "opus"] }, { version: "1", options: ["--model", "opus"] }, { options: ["--model", "opus"] },
+    { version: 1 }, { version: 1, options: "--model opus" }, { version: 1, options: [7] }, { version: 1, options: {} },
+    { version: 1, args: ["--model", "opus"] },
+    { version: 1, options: ["--model", "op\nus"] }, { version: 1, options: ["--model", "op\x1bus"] }, { version: 1, options: ["--model\x7f", "opus"] },
   ].map(JSON.stringify)]) {
     assert.equal(claudeOptionsRecord(raw), null, String(raw));
   }
@@ -112,10 +120,11 @@ test("a record with anything but kept options is ignored, so a label written by 
     ["--settings", '{"apiKeyHelper":"x"}'], ["--model", "opus", "--mcp-config", "/m.json"], ["--system-prompt", "x"],
     ["--allowedTools", "Edit"], ["--add-dir", "relative"], ["--model", "opus", "prompt"], ["--resume", "id"],
     ["--model"], ["--add-dir"], ["--model", "opus", "--", "prompt"],
+    ["--strict-mcp-config", "--mcp-config", "/m.json"],
   ]) {
-    assert.equal(claudeOptionsRecord(JSON.stringify({ version: 1, args })), null, JSON.stringify(args));
+    assert.equal(claudeOptionsRecord(JSON.stringify({ version: 1, options: args })), null, JSON.stringify(args));
   }
-  assert.deepEqual(claudeOptionsRecord(JSON.stringify({ version: 1, args: [] })), []);
-  assert.deepEqual(claudeOptionsRecord(JSON.stringify({ version: 1, args: ["--tools", "", "--add-dir", "/a", "~/b", "--verbose"] })),
+  assert.deepEqual(claudeOptionsRecord(JSON.stringify({ version: 1, options: [] })), []);
+  assert.deepEqual(claudeOptionsRecord(JSON.stringify({ version: 1, options: ["--tools", "", "--add-dir", "/a", "~/b", "--verbose"] })),
     ["--tools", "", "--add-dir", "/a", "~/b", "--verbose"]);
 });
