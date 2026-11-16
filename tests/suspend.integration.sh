@@ -388,6 +388,15 @@ for case in "$run_agent pi agent" "$fish_agent claude shell"; do
   check "$t: the wake found the fake $agent through the core's PATH ($(cat "$run/exe"))" [ "$(cat "$run/exe")" = "$bin/$agent" ]
   check "$t: the woken agent runs in the recorded folder" [ "$(cat "$run/cwd")" = "$recorded_cwd" ]
   check "$t: woken in place (same main program pid as the stand-in)" [ "$(field "$t" 't.pid')" = "$standin_pid" ]
+  if [ "$root" = shell ]; then
+    # The wrapper uses job control, so hc names the agent in front, not the
+    # wrapper: the policy sees root=shell again and can suspend it again.
+    # hc samples the program in front every 500 ms: give it a few samples.
+    n=0
+    while [ "$(field "$t" 't.foreground?.pid ?? 0')" = "$standin_pid" ] && [ "$n" -lt 30 ]; do n=$((n + 1)); sleep 0.1; done
+    check "$t: hc names the woken agent in front, not the shell wrapper" \
+      [ "$(field "$t" 't.foreground?.pid ?? 0')" != "$standin_pid" ]
+  fi
   check "$t: address, name, labels and parent unchanged after the wake" [ "$(identity "$t")" = "$identity_before" ]
   check "$t: its child terminal is still live and still its child" [ "$(field "$child" '`${t.state}:${t.parent}`')" = "live:$t" ]
   check "$t: the message was not typed into the woken agent again" [ ! -s "$run/stdin" ]

@@ -354,6 +354,10 @@ describe("wake", () => {
     expect(command).toEqual(["claude", "--resume", "claude-id", "--", "hi"]);
     expect(t.steps).toContain("hc label t9 herdr.suspended=");
     expect(t.steps.indexOf("hc label t9 herdr.suspended=")).toBeLessThan(t.steps.indexOf("exec /bin/sh"));
+    // Job control first: the agent gets its own process group, so hc names the
+    // agent (not this wrapper) as the program in front, and the policy can
+    // suspend it again as root=shell.
+    expect(script.startsWith("set -m; ")).toBe(true);
     // The script runs the words it is given, then the user's shell.
     const run = Bun.spawnSync(["/bin/sh", "-c", script, name, "printf", "%s|", "a b", "--", "it's\nmultiline"], { env: { SHELL: "/bin/echo" } });
     expect(run.stdout.toString()).toBe("a b|--|it's\nmultiline|\n");

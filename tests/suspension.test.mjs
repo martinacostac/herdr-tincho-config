@@ -146,6 +146,21 @@ const labelOf = (call) => JSON.parse(call.at(-1).slice(`${SUSPENDED}=`.length));
 
 test.after(() => { if (home) rmSync(home, { recursive: true, force: true }); rmSync(sessions, { recursive: true, force: true }); });
 
+// A Pi woken from root=shell before the stand-in's wrapper used job control:
+// the wrapper (100) is the main program and what hc names in front; pi (105)
+// is its child. It is suspended as root=shell: the wrapper gets SIGKILL, and
+// pi gets SIGHUP from the kernel, its clean shutdown.
+test("an agent under the stand-in's shell wrapper is suspended as root shell", async () => {
+  reset();
+  core.t7 = [piCore({ argv: ["/bin/herdr-shell"], foreground: { pid: 100, argv: ["/bin/sh", "-c", "..."], cwd: "/project" } })];
+  processRows = [[1, 0, "/sbin/launchd"], [90, 1, "hc server"], [100, 90, "/bin/sh -c \"$@\"; exec \"${SHELL:-/bin/sh}\" sh pi"],
+    [105, 100, "pi"], [106, 105, "npm exec shadcn@latest mcp"], [200, 90, "fish"], [201, 200, "claude"], [50, 90, "fish"]];
+  assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: true });
+  const done = actions();
+  assert.equal(labelOf(done[3]).root, "shell");
+  assert.deepEqual(done.filter(([command]) => command === "kill"), [["kill", "-KILL", "100"]]);
+});
+
 test("a suspension checks, keeps, checks again, labels and signals, in that order", async () => {
   reset();
   const s = createSuspender({ id: "a" });

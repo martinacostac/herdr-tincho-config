@@ -48,8 +48,10 @@ const BATCH_MS = 500;
 const RETRY_MS = 200;
 const RETRIES = 10; // about 2 s while the core restarts
 // Runs the words it is given, then the user's shell with shellWords, so
-// exiting the agent returns to a prompt.
-const thenShell = (shellWords: string[]) => `"$@"; exec "\${SHELL:-/bin/sh}"${shellWords.map((w) => ` ${shellQuote(w)}`).join("")}`;
+// exiting the agent returns to a prompt. `set -m` (job control) gives the
+// agent its own process group: hc then names the agent, not this wrapper, as
+// the program in front, and the policy can suspend it again (root=shell).
+const thenShell = (shellWords: string[]) => `set -m; "$@"; exec "\${SHELL:-/bin/sh}"${shellWords.map((w) => ` ${shellQuote(w)}`).join("")}`;
 
 type Status = "idle" | "working" | "blocked";
 // An OSC 7501 status report (fact F5 in plans/agent-suspension.md).

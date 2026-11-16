@@ -372,6 +372,34 @@ test("a background job in the shell that hosts the agent keeps the agent in use,
   assert.deepEqual(await unusedAgent(claude(), { now: NOW }), { unused: false, reason: "processes-unknown" });
 });
 
+// A woken agent that ran inside a shell: the stand-in's `/bin/sh -c '"$@"; exec
+// $SHELL'` wrapper is the main program. Without job control in the wrapper, the
+// agent shares its process group, so hc names the wrapper as the program in
+// front. The agent is the wrapper's child, not a background job.
+const wrapped = (extra = {}) => pi({
+  argv: ["/Users/me/.local/share/herdr-tincho-config/bin/herdr-shell"],
+  foreground: { pid: 100, argv: ["/bin/sh", "-c", "..."], cwd: "/project" }, ...extra,
+});
+const wrappedProcesses = [
+  [1, 0, "/sbin/launchd"],
+  [90, 1, "/Applications/Herdr.app/Contents/MacOS/hc server"],
+  [100, 90, "/bin/sh -c \"$@\"; exec \"${SHELL:-/bin/sh}\" '-l' sh pi --session /s.jsonl -- hello"],
+  [105, 100, "pi"],
+  [106, 105, "npm exec shadcn@latest mcp"],
+];
+
+test("an agent under the stand-in's shell wrapper is the agent, not a background process", async () => {
+  reset();
+  processTable = table(wrappedProcesses);
+  assert.deepEqual(await unusedAgent(wrapped(), { now: NOW }), { unused: true, agent: "pi" });
+  // Another child of the wrapper is still a background process.
+  processTable = table([...wrappedProcesses, [107, 100, "npm run dev"]]);
+  assert.deepEqual(await unusedAgent(wrapped(), { now: NOW }), { unused: false, reason: "background" });
+  // A plain program that is not a shell keeps its children as background.
+  processTable = table([[1, 0, "/sbin/launchd"], [100, 1, "node server.js"], [105, 100, "pi"]]);
+  assert.deepEqual(await unusedAgent(wrapped(), { now: NOW }), { unused: false, reason: "background" });
+});
+
 test("child terminals do not prevent eligibility", async () => {
   reset();
   // The child terminal's agent runs under the core, not under its parent agent.

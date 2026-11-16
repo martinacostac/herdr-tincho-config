@@ -95,7 +95,7 @@ const statusOf = (t) => typeof t?.status === "string" ? t.status : t?.status?.st
 /**
  * @param {Record<string, any>} terminal
  * @param {{ now?: number, focusedAt?: number | null, manual?: boolean, focusedTerminals?: Set<string> | null, skipSlowRules?: boolean }} [options]
- * @param {{ table?: ProcessTable | null }} [snapshot]
+ * @param {{ table?: ProcessTable | null, place?: { agentPid: number, root: Root } }} [snapshot]
  * @returns {Promise<Verdict>}
  */
 export async function unusedAgent(terminal, { now = Date.now(), focusedAt = null, manual = false, focusedTerminals = null, skipSlowRules = false } = {}, snapshot = {}) {
@@ -123,13 +123,42 @@ export async function unusedAgent(terminal, { now = Date.now(), focusedAt = null
   if (skipSlowRules) return { unused: true, agent };
   if (!await RESUMABLE[agent].onDisk(labels)) return { unused: false, reason: "not-resumable" };
   snapshot.table = await processTable();
-  const allHelpers = onlyHelpers(snapshot.table, terminal.pid, terminal.foreground?.pid, config.helpers);
+  snapshot.place = agentPlace(snapshot.table, terminal, agent);
+  const allHelpers = onlyHelpers(snapshot.table, terminal.pid, snapshot.place.agentPid, config.helpers);
   if (allHelpers === null) return { unused: false, reason: "processes-unknown" };
   if (!allHelpers) return { unused: false, reason: "background" };
   return { unused: true, agent };
 }
 
 /** @typedef {{ parents: Map<number, number>, children: Map<number, { pid: number, command: string }[]> }} ProcessTable */
+
+const SHELLS = new Set(["sh", "bash", "dash", "zsh", "fish", "ksh"]);
+/** @param {string} command */
+const programName = (command) => (command.trim().split(/\s+/)[0] ?? "").split("/").pop() ?? "";
+
+// Where the agent runs. When hc names a program in front other than the main
+// program, a shell hosts the agent in front (root=shell). When they are the
+// same, the main program is usually the agent (root=agent). But a shell
+// without job control, like the stand-in's `/bin/sh -c '"$@"; exec $SHELL'`
+// wrapper after waking an agent that ran inside a shell, keeps the agent in
+// its own process group, so hc names the shell in front: then the shell's
+// child that runs the agent is the agent, and the shell hosts it.
+/**
+ * @param {ProcessTable | null} table @param {Record<string, any>} terminal @param {string} agent
+ * @returns {{ agentPid: number, root: Root }}
+ */
+function agentPlace(table, terminal, agent) {
+  const main = terminal.pid;
+  const front = terminal.foreground?.pid;
+  if (front !== main) return { agentPid: front, root: "shell" };
+  const parent = table?.parents.get(main);
+  const own = (table?.children.get(parent) ?? []).find((p) => p.pid === main);
+  if (own && SHELLS.has(programName(own.command))) {
+    const child = (table?.children.get(main) ?? []).find((p) => programName(p.command) === agent);
+    if (child) return { agentPid: child.pid, root: "shell" };
+  }
+  return { agentPid: main, root: "agent" };
+}
 
 // Every process on this machine with its parent and command line, or null
 // when ps cannot be read.
@@ -692,16 +721,17 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
     const before = await coreTerminal(address);
     if (closed) return abort("closed");
     if (before?.state !== "live") return abort("gone");
-    /** @type {{ table?: ProcessTable | null }} */
+    /** @type {{ table?: ProcessTable | null, place?: { agentPid: number, root: Root } }} */
     const snapshot = {};
     const verdict = await unusedAgent(before, { now, manual, ...rulesInput(focusView(now), address) }, snapshot);
     if (closed) return abort("closed");
     if ("reason" in verdict) return abort(verdict.reason);
     const pid = before.pid;
     if (!Number.isSafeInteger(pid) || pid <= 0) return abort("processes-unknown");
-    // A shell hosts the agent when the main program is not the agent itself.
+    // A shell hosts the agent when the main program is not the agent itself
+    // (agentPlace, read in step 1).
     /** @type {Root} */
-    const root = pid === before.foreground?.pid ? "agent" : "shell";
+    const root = snapshot.place?.root ?? (pid === before.foreground?.pid ? "agent" : "shell");
     // The agent's helpers, every process under it in the process snapshot of
     // step 1 (each child of the agent is a helper, or step 1 refused it): a
     // wrapper (uvx, npx) may not pass SIGTERM on to the server it started.
