@@ -18,14 +18,24 @@ Other mods can, through the app's shared state, request a manual suspension of a
 
 **Blocked by:** 01 (fact F3), 03 (shares the tab-tree mod's main module), 04 (eligibility rules)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Mocked-host tests cover the ordered steps and an abort at each step, with nothing done after the abort
-- [ ] Tests cover root detection for a shell-hosted agent and an agent that hc started directly
-- [ ] Tests cover the signal choice from F3
-- [ ] Tests cover refusal when the stand-in or launcher is missing, or the launcher is not hc's shell
-- [ ] Tests cover leader choice with two copies: only one acts
-- [ ] Tests cover wake on 1 s of focus, and no wake when focus moves on before 1 s
-- [ ] Tests cover a manual request: threshold skipped, other rules applied, reason available to the requester
-- [ ] Automatic suspension does nothing when it is turned off in the settings, while manual requests still work
-- [ ] The existing tab-tree tests still pass
+- [x] Mocked-host tests cover the ordered steps and an abort at each step, with nothing done after the abort
+- [x] Tests cover root detection for a shell-hosted agent and an agent that hc started directly
+- [x] Tests cover the signal choice from F3
+- [x] Tests cover refusal when the stand-in or launcher is missing, or the launcher is not hc's shell
+- [x] Tests cover leader choice with two copies: only one acts
+- [x] Tests cover wake on 1 s of focus, and no wake when focus moves on before 1 s
+- [x] Tests cover a manual request: threshold skipped, other rules applied, reason available to the requester
+- [x] Automatic suspension does nothing when it is turned off in the settings, while manual requests still work
+- [x] The existing tab-tree tests still pass
+
+## Comments
+
+Done in eff0054 and 608b792 (review fixes).
+
+- `herdr/mods/tab-tree/suspend-policy.js`: `createSuspender()` holds the leader choice, focus tracking across windows, wake on focus, manual requests and the ordered steps (recheck, `hc keep`, recheck status/turn/program, `herdr.suspended` label with `root` from main pid vs foreground pid, `kill -TERM` on the main program per F3). Nothing is suspended (reason `not-installed`) unless `$XDG_DATA_HOME/herdr-tincho-config/bin/{herdr-standin,herdr-shell}` exist and herdr-core's `shell = [...]` names that herdr-shell. Helpers: a descendant under a helper is part of it. New rule reason `suspended` (the label is already set).
+- `main.js`: no short timer. `render` calls `observe()` (focus and requests, no side effects); `act()` runs in `cx.spawn` (publish, one 1 s `cx.timer.after` per focused suspended agent, cancelled when the focus moves, requests). One 15 s pass: heartbeat (60 s), shared reasons, automatic suspension. It starts no process while no agent is past its threshold. The unused `SESSION` import is gone.
+- Entry point for ticket 09 (shape in the comment above `SUSPEND_REQUESTS`): other mods set `tincho.suspend.requests[address] = Date.now()`; the leader writes `tincho.suspend.state` = `{ agents: { [address]: { auto, manual } }, results: { [address]: { requested, suspended, reason, at } } }`. Shared reasons skip the process rule (a `background` reason shows only after an attempt and in results).
+- Tests: `tests/suspension.test.mjs` (32), `tests/suspension-mod.test.mjs` (1), `tests/suspend-policy.test.mjs` (30). Stub host names added to the claude-polling and recovery-lifecycle mocks, and their timer list is now `[3000, 10000, 15000]` (approved by t4).
+- Open: `root` is `shell` whenever the main program is not the agent (a non-shell wrapper also counts as `shell`). The 60 s heartbeat `setShared` is idle work that README "Idle work" should mention (ticket 13). GLOSSARY "Unused agent" says "the focused tab"; the code means the focused tab of any window.
