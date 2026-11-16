@@ -37,7 +37,7 @@ The reusable command-line options an agent was started with (model, sandbox, too
 _Avoid_: Args, flags, argv
 
 **Unused agent**:
-A resumable agent that is idle past the configured threshold, not in the focused tab, not running its own background processes, not blocked, and not pinned.
+A resumable agent that is idle past the configured threshold, not focused in any window, not running its own background processes, not blocked, and not pinned.
 
 **Stand-in**:
 The tiny program that holds a suspended agent's terminal, receives the messages sent to it, and wakes the agent with them.
