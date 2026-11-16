@@ -11,11 +11,21 @@ The module keeps the existing label names and the Pi record parser. It must stay
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Each recipe returns a working folder and a command word list for every agent and session case (Claude: session id, tab name, picker; Pi: session file, session id only, picker, no record)
-- [ ] The existing resume and recovery-lifecycle tests pass unchanged: recovery types exactly the same lines as before
-- [ ] New tests cover the working folder and command for each case
-- [ ] The suspension record parser accepts a valid record and rejects malformed, future-version, relative-folder and control-containing records
-- [ ] The Pi session check is a pure helper with tests, and recovery uses it
-- [ ] The module imports no Herdr host module
+- [x] Each recipe returns a working folder and a command word list for every agent and session case (Claude: session id, tab name, picker; Pi: session file, session id only, picker, no record)
+- [x] The existing resume and recovery-lifecycle tests pass unchanged: recovery types exactly the same lines as before
+- [x] New tests cover the working folder and command for each case
+- [x] The suspension record parser accepts a valid record and rejects malformed, future-version, relative-folder and control-containing records
+- [x] The Pi session check is a pure helper with tests, and recovery uses it
+- [x] The module imports no Herdr host module
+
+## Comments
+
+Done in fb637d2 and def21ab (review fixes).
+
+- `recipes.js` exports `recipe(agent, labels, { tab, picker })` → `{ cwd, argv }` (null for an agent without a recipe). The input is the terminal's labels, so a new label (ticket 03's `herdr.claude-options`) changes only the module's `INPUTS` table. `cwd` is null when the start does not need a folder of its own (Claude, Pi with a session file). It is the recorded folder for Pi with only a session id and for Pi's picker.
+- `recoveryLine(agent, labels, options)` builds recovery's shell line from the same start, through `shellQuote`: the recipe's own words are left bare and every recorded word is quoted, so the lines are exactly the same as before. `RECIPES` keeps its parsed-input, string-returning form (built from the same starts), because the unchanged tests and `main.js` (key check) use it. New callers should use `recipe()`.
+- New: `SUSPENDED = "herdr.suspended"`, `suspension(raw)` (version 1, agent with a recipe, root `shell`/`agent`, absolute printable `cwd`, `since` a non-negative safe integer; returns only those fields), and `holdsPiSession(head, sessionId)`, which recovery now uses.
+- Tests: new `tests/recipes.test.mjs`, including a test that the module imports nothing. `tests/resume.test.mjs` and `tests/recovery-lifecycle.test.mjs` are unchanged and pass. Full run: 154/154 node tests pass, and the installer tests pass.
+- Note for ticket 05: the stand-in has two folders, `recipe().cwd` and the suspension record's `cwd`. It must decide which one wins when both are set (Pi with only a session id, or the picker). It must also run `holdsPiSession` itself and pass `picker`.
