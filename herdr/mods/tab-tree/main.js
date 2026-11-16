@@ -208,8 +208,9 @@ export default class TabTree extends View {
     }
   }
 
-  // Labels each local terminal running Claude with its session id (SESSION),
-  // so ↻ resumes that exact conversation. One pass at a time, terminals in turn.
+  // Labels each local terminal running Claude with its session id (SESSION)
+  // and launch options (CLAUDE_OPTIONS), so ↻ and waking resume that exact
+  // conversation the same way. One pass at a time, terminals in turn.
   rememberSessions(cx) {
     if (this.sessionsBusy) return;
     // Every core terminal, not panes(): sub-agents run in terminals no pane lists.
@@ -223,9 +224,9 @@ export default class TabTree extends View {
             const current = () => terminals().find((t) => t.address === address && claudeCandidate(t) && processIdentity(t) === identity);
             const before = current();
             if (!before) continue;
-            const id = await claudeSession(address, before).catch(() => null);
+            const found = await claudeSession(address, before).catch(() => null);
             const after = current();
-            if (id && after && (after.labels ?? {})[SESSION] !== id) await rememberSession(address, id).catch(() => null);
+            if (found && after) await rememberSession(address, found, after.labels ?? {}).catch(() => null);
           }
         } finally {
           this.sessionsBusy = false;

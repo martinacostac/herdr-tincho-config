@@ -87,6 +87,15 @@ test("Pi recovery sends once, checks the file, and never uses Claude's session o
   assert.deepEqual(calls[0], ["exec", "sh", ["-c", 'test -f "$1" && head -c 4096 "$1"', "sh", record.sessionFile]]);
 });
 
+test("Claude recovery types its launch options before --resume", async () => {
+  reset();
+  current = { ...current, reported: true };
+  const claude = { "herdr.claude-session": "claude-id", "herdr.claude-options": JSON.stringify({ version: 1, args: ["--model", "haiku", "--permission-mode", "plan"] }) };
+  await recover(cx, "t42", "claude", claude, "tab name");
+  await recover(cx, "t43", "claude", { "herdr.claude-session": "claude-id" }, "tab name");
+  assert.deepEqual(sent(), [["send", "t42", "claude '--model' 'haiku' '--permission-mode' 'plan' --resume 'claude-id'"], ["send", "t43", "claude --resume 'claude-id'"]]);
+});
+
 test("missing file or metadata opens the picker without timeout or /exit", async () => {
   reset();
   fileCode = 1;

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { registerHooks } from "node:module";
-import { LABEL, SESSION } from "../herdr/mods/tab-tree/recipes.js";
+import { CLAUDE_OPTIONS, LABEL, SESSION } from "../herdr/mods/tab-tree/recipes.js";
 
 // Mock only host boundaries. The real timer callback, selector, probe, and
 // label command construction run without Herdr, a UI, or session-file reads.
@@ -254,4 +254,55 @@ test("a spawn failure cannot leave the poller busy", async () => {
   assert.equal(view.sessionsBusy, false);
   await start(view);
   assert.equal(writes().length, 1);
+});
+
+const optionsLabel = (args) => JSON.stringify({ version: 1, args });
+const launched = (argv, extra = {}) => terminal("claude", { foreground: { pid: 11, cwd: "/work", argv }, ...extra });
+
+test("the launch options of the Claude process read are written in the same label call as its session", async () => {
+  const view = reset([launched(["claude", "--model", "haiku", "--permission-mode", "plan", "--add-dir", "lib", "--", "secret prompt"])]);
+  await start(view);
+  assert.deepEqual(writes(), [["hc", ["label", "t1", `${SESSION}=session-a`, `${CLAUDE_OPTIONS}=${optionsLabel(["--model", "haiku", "--permission-mode", "plan", "--add-dir", "/work/lib"])}`]]]);
+  assert.doesNotMatch(JSON.stringify(writes()), /secret/);
+});
+
+test("options are read from the core's process, the same one whose session file was read, in each argv shape", async () => {
+  for (const argv of [
+    ["claude", "--model", "haiku", "--"],
+    ["node", "/pkg/@anthropic-ai/claude-code/cli.js", "--model", "haiku", "--"],
+    ["fish", "-ic", "command $argv[2..]; exec $argv[1] -i", "fish", "claude", "--model", "haiku", "--"],
+  ]) {
+    const view = reset([launched(["claude"])]);
+    get = async () => result({ ...launched(argv), program: undefined, report: undefined, status: { app: "claude-code" } });
+    await start(view);
+    assert.deepEqual(writes(), [["hc", ["label", "t1", `${SESSION}=session-a`, `${CLAUDE_OPTIONS}=${optionsLabel(["--model", "haiku"])}`]]], JSON.stringify(argv));
+  }
+});
+
+test("unchanged options are not written again, and a changed session alone writes only the session", async () => {
+  const value = optionsLabel(["--model", "haiku"]);
+  const view = reset([launched(["claude", "--model", "haiku"], { labels: { [SESSION]: "session-a", [CLAUDE_OPTIONS]: value } })]);
+  await start(view);
+  assert.deepEqual(writes(), []);
+  readSession = async () => result({ sessionId: "after-clear" });
+  await start(view);
+  assert.deepEqual(writes(), [["hc", ["label", "t1", `${SESSION}=after-clear`]]]);
+});
+
+test("options change with the process: new options are written, and a Claude without options removes the old label", async () => {
+  const view = reset([launched(["claude", "--model", "opus"], { labels: { [SESSION]: "session-a", [CLAUDE_OPTIONS]: optionsLabel(["--model", "haiku"]) } })]);
+  await start(view);
+  assert.deepEqual(writes(), [["hc", ["label", "t1", `${CLAUDE_OPTIONS}=${optionsLabel(["--model", "opus"])}`]]]);
+  for (const labels of [{ [SESSION]: "session-a", [CLAUDE_OPTIONS]: optionsLabel(["--model", "haiku"]) }, { [SESSION]: "session-a", [CLAUDE_OPTIONS]: "{broken" }]) {
+    const plain = reset([launched(["claude", "a prompt"], { labels })]);
+    await start(plain);
+    assert.deepEqual(writes(), [["hc", ["label", "t1", `${CLAUDE_OPTIONS}=`]]]);
+  }
+});
+
+test("no session id means no options are written either", async () => {
+  const view = reset([launched(["claude", "--model", "haiku"])]);
+  readSession = async () => ({ code: 1, stdout: "" });
+  await start(view);
+  assert.deepEqual(writes(), []);
 });

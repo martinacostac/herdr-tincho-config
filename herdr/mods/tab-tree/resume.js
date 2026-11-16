@@ -4,9 +4,9 @@
 // restarts), and recipes.js says how each agent starts again.
 
 import { hc, exec } from "herdr";
-import { isClaude, processIdentity } from "./claude-polling.js";
+import { isClaude, processIdentity, claudeLaunchWords } from "./claude-polling.js";
 
-import { LABEL, SESSION, PI_RECOVERY, piRecovery, holdsPiSession, recoveryLine } from "./recipes.js";
+import { LABEL, SESSION, CLAUDE_OPTIONS, PI_RECOVERY, piRecovery, holdsPiSession, recoveryLine, claudeOptionsLabel } from "./recipes.js";
 export { LABEL, SESSION, RECIPES } from "./recipes.js";
 
 // Types a command line into the terminal's shell, so the person's own agent
@@ -105,9 +105,11 @@ export function remember(address, agent) {
   return hc(["label", address, `${LABEL}=${agent}`]);
 }
 
-// The id of the Claude session running in front in a terminal, or null. Claude
-// writes ~/.claude/sessions/<pid>.json for each running process (sessionId
-// follows /clear and /resume inside it).
+// The Claude session running in front in a terminal, or null: its id and its
+// CLAUDE_OPTIONS label value (null: no options). Claude writes
+// ~/.claude/sessions/<pid>.json for each running process (sessionId follows
+// /clear and /resume inside it). The options come from the argv of that same
+// process.
 export async function claudeSession(address, expected) {
   const j = await info(address);
   const pid = j?.foreground?.pid;
@@ -115,6 +117,7 @@ export async function claudeSession(address, expected) {
   if ((expected?.pid != null && expected.pid !== j.pid) ||
       (expected?.foreground?.pid != null && expected.foreground.pid !== pid)) return null;
   const identity = processIdentity(j);
+  const options = claudeOptionsLabel(claudeLaunchWords(j), j.foreground.cwd);
   const r = await exec("sh", ["-c", 'cat "$HOME/.claude/sessions/$1.json"', "sh", String(pid)]).catch(() => null);
   let id;
   try { id = r?.code === 0 ? JSON.parse(r.stdout).sessionId : null; } catch { return null; }
@@ -122,9 +125,14 @@ export async function claudeSession(address, expected) {
   // The file read yields to other work. Reject a process switch even if the
   // app's terminals() snapshot has not caught up with the core yet.
   const after = await info(address);
-  return after?.state === "live" && isClaude(after) && processIdentity(after) === identity ? id : null;
+  return after?.state === "live" && isClaude(after) && processIdentity(after) === identity ? { id, options } : null;
 }
 
-export function rememberSession(address, id) {
-  return hc(["label", address, `${SESSION}=${id}`]);
+// Writes what changed of a claudeSession result, in one label call: the
+// session, and the options (removed when the process has none).
+export async function rememberSession(address, { id, options }, labels = {}) {
+  const changes = [];
+  if (labels[SESSION] !== id) changes.push(`${SESSION}=${id}`);
+  if ((labels[CLAUDE_OPTIONS] ?? null) !== options) changes.push(`${CLAUDE_OPTIONS}=${options ?? ""}`);
+  return changes.length ? hc(["label", address, ...changes]) : null;
 }

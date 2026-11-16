@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { PI_RECOVERY, SESSION, SUSPENDED, holdsPiSession, recipe, recoveryLine, suspension } from "../herdr/mods/tab-tree/recipes.js";
+import { CLAUDE_OPTIONS, PI_RECOVERY, SESSION, SUSPENDED, holdsPiSession, recipe, recoveryLine, suspension } from "../herdr/mods/tab-tree/recipes.js";
 
 const record = { version: 1, sessionId: "session-123", sessionFile: "/sessions/it's a session.jsonl", cwd: "/project", args: ["--thinking", "high"] };
 const pi = (value) => ({ [PI_RECOVERY]: JSON.stringify(value) });
@@ -13,6 +13,27 @@ test("Claude starts from its session id, then the tab name, then the picker, in 
 
 test("Claude never reads Pi's record", () => {
   assert.deepEqual(recipe("claude", pi(record)), { cwd: null, argv: ["claude", "--resume"] });
+});
+
+const options = (args, version = 1) => ({ [CLAUDE_OPTIONS]: JSON.stringify({ version, args }) });
+
+test("Claude starts with its launch options before --resume, so a resumed Claude records them again", () => {
+  const labels = { [SESSION]: "claude-id", ...options(["--model", "haiku", "--add-dir", "/it's", "--verbose"]) };
+  assert.deepEqual(recipe("claude", labels), { cwd: null, argv: ["claude", "--model", "haiku", "--add-dir", "/it's", "--verbose", "--resume", "claude-id"] });
+  assert.deepEqual(recipe("claude", { ...labels, [SESSION]: undefined }, { tab: "tab" }).argv, ["claude", "--model", "haiku", "--add-dir", "/it's", "--verbose", "--resume", "tab"]);
+  assert.equal(recoveryLine("claude", labels), "claude '--model' 'haiku' '--add-dir' '/it'\\''s' '--verbose' --resume 'claude-id'");
+  assert.equal(recoveryLine("claude", options(["--model", "haiku"])), "claude '--model' 'haiku' --resume");
+});
+
+test("Claude starts without options when the options label is malformed or from a future version", () => {
+  for (const labels of [{ [CLAUDE_OPTIONS]: "not json" }, options(["--model", "haiku"], 2), options(["--settings", "{}"]), options(["--model", "hai\nku"])]) {
+    assert.deepEqual(recipe("claude", { [SESSION]: "claude-id", ...labels }), { cwd: null, argv: ["claude", "--resume", "claude-id"] });
+    assert.equal(recoveryLine("claude", { [SESSION]: "claude-id", ...labels }), "claude --resume 'claude-id'");
+  }
+});
+
+test("Pi never reads Claude's launch options", () => {
+  assert.deepEqual(recipe("pi", { ...pi(record), ...options(["--model", "haiku"]) }), recipe("pi", pi(record)));
 });
 
 test("Pi starts from its session file anywhere, keeping its launch options as separate words", () => {
