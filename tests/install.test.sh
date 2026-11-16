@@ -20,6 +20,12 @@ assert_file() { [ -f "$1" ] || fail "missing $1"; }
 assert_absent() { [ ! -e "$1" ] || fail "unexpected $1"; }
 assert_same() { cmp -s "$1" "$2" || fail "$1 differs from $2"; }
 assert_log() { grep -F "$1" "$log" >/dev/null || fail "missing log: $1"; }
+# The caller's PATH without folders that hold a bun, so a real Bun never
+# builds anything here. Tests that need Bun put a fake one first.
+nobun_path=$(printf '%s\n' "$PATH" | tr ':' '\n' | while IFS= read -r dir; do
+  if [ -n "$dir" ] && [ ! -x "$dir/bun" ]; then printf '%s:' "$dir"; fi
+done)
+nobun_path=${nobun_path%:}
 hash() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | cut -d' ' -f1
@@ -35,8 +41,10 @@ fixture() {
   config=
   app_override=
   pi_override=
-  run_path=$PATH
+  data_override=
+  run_path=$nobun_path
   app="$home/.config/herdr-app"
+  bin="$home/.local/share/herdr-tincho-config/bin"
   pi="$home/.pi/agent"
   record="$state/herdr-tincho-config"
   log="$case_dir/output"
@@ -58,9 +66,41 @@ fixture() {
 run() {
   # Do not inherit any real install roots, git overrides, or shell startup files.
   env -i PATH="$run_path" HOME="$home" XDG_CONFIG_HOME="$config" \
-    XDG_STATE_HOME="$state" HERDR_APP_HOME="$app_override" \
+    XDG_STATE_HOME="$state" XDG_DATA_HOME="$data_override" HERDR_APP_HOME="$app_override" \
     PI_CODING_AGENT_DIR="$pi_override" sh "$repo/install.sh" "$@"
 }
+# Stand-in sources in the fixture repo: the real build script and launcher,
+# and small stand-ins for the TypeScript sources and the shared recipe module.
+suspend_sources() {
+  mkdir -p "$repo/suspend" "$repo/herdr/mods/tab-tree"
+  cp "$project/suspend/build.sh" "$project/suspend/herdr-shell" "$repo/suspend/"
+  printf 'import "./standin";\n' > "$repo/suspend/main.ts"
+  printf 'import { recipe } from "../herdr/mods/tab-tree/recipes.js";\nexport const standin = 1;\n' > "$repo/suspend/standin.ts"
+  printf 'export const recipe = 1;\n' > "$repo/herdr/mods/tab-tree/recipes.js"
+}
+# A fake bun first on PATH. $1: aot (has `bun compile`), standard (only
+# `bun build --compile`) or broken (every build fails). Each build writes a
+# different file, like a build that is not reproducible, and is logged in
+# $builds, one line per build.
+fake_bun() {
+  builds="$case_dir/bun-builds"
+  mkdir -p "$case_dir/fake-bin"
+  : > "$builds"
+  cat > "$case_dir/fake-bin/bun" <<EOF
+#!/bin/sh
+mode=$1
+if [ "\$*" = 'compile --help' ]; then [ \$mode = aot ]; exit; fi
+[ "\$1" = compile ] && [ \$mode != aot ] && exit 1
+printf '%s\n' "\$*" >> '$builds'
+[ \$mode = broken ] && { echo 'error: fake build failure' >&2; exit 1; }
+out=
+while [ \$# -gt 0 ]; do [ "\$1" = --outfile ] && out=\$2; shift; done
+printf 'built by fake bun, process %s\n' \$\$ > "\$out"
+EOF
+  chmod +x "$case_dir/fake-bin/bun"
+  run_path="$case_dir/fake-bin:$nobun_path"
+}
+build_count() { wc -l < "$builds" | tr -d ' '; }
 
 fixture no-pi
 rmdir "$home/.pi"
@@ -221,6 +261,113 @@ assert_same "$repo/pi/extensions/herdr-recovery/index.ts" "$pi/extensions/herdr-
 [ -z "$(find "$app" "$pi" -name '*.install-tmp' -print)" ] || fail 'staging files remain'
 echo 'ok - first installs and managed updates use staging writes'
 
+fixture standin-aot
+suspend_sources
+fake_bun aot
+run > "$log"
+[ "$(build_count)" = 1 ] || fail "expected one build, got $(build_count)"
+grep -F 'compile --trim-locales en --no-compile-function-source --outfile' "$builds" >/dev/null ||
+  fail "not the ahead-of-time compile: $(cat "$builds")"
+grep -F 'built by fake bun' "$bin/herdr-standin" >/dev/null || fail 'stand-in not installed'
+[ -x "$bin/herdr-standin" ] || fail 'stand-in not executable'
+assert_same "$repo/suspend/herdr-shell" "$bin/herdr-shell"
+[ -x "$bin/herdr-shell" ] || fail 'herdr-shell not executable'
+[ -z "$(find "$bin" -name '*.install-tmp' -print)" ] || fail 'staging files remain'
+assert_file "$app/mods/example/main.js"
+# Nothing is added to PATH: no shell startup file is written.
+[ -z "$(cd "$home" && find . -name '.*rc' -o -name '.*profile' -o -name config.fish)" ] ||
+  fail 'a shell startup file was written'
+if grep -F 'PATH' "$log" >/dev/null; then fail 'install talks about PATH'; fi
+echo 'ok - the ahead-of-time compile installs the stand-in and herdr-shell outside PATH'
+
+fixture standin-standard
+suspend_sources
+fake_bun standard
+data_override="$case_dir/xdg data"
+bin="$data_override/herdr-tincho-config/bin"
+run > "$log"
+[ "$(build_count)" = 1 ] || fail "expected one build, got $(build_count)"
+grep -F 'build --compile --minify --outfile' "$builds" >/dev/null ||
+  fail "not the standard compile: $(cat "$builds")"
+assert_log 'standard compile'
+[ -x "$bin/herdr-standin" ] || fail 'stand-in not installed in XDG_DATA_HOME'
+[ -x "$bin/herdr-shell" ] || fail 'herdr-shell not installed in XDG_DATA_HOME'
+assert_absent "$home/.local/share"
+echo 'ok - without bun compile, the standard compile is used; XDG_DATA_HOME is honored'
+
+fixture standin-no-bun
+suspend_sources
+run > "$log"
+assert_log 'suspend: skipped (no bun)'
+assert_file "$app/mods/example/main.js"
+assert_file "$pi/extensions/herdr-recovery/index.ts"
+assert_absent "$home/.local/share"
+assert_absent "$record/installed-suspend"
+echo 'ok - without bun the stand-in is skipped and the rest installs'
+
+fixture standin-rebuild
+suspend_sources
+fake_bun aot
+run > "$log"
+cp "$record/installed-suspend" "$case_dir/suspend-record"
+cp "$bin/herdr-standin" "$case_dir/first-build"
+# Keyed by the source hash: never by the hash of the (unreproducible) binary.
+entry=$(awk '$2 == "herdr-standin" { print $1 }' "$record/installed-suspend")
+[ -n "$entry" ] || fail 'no manifest entry for herdr-standin'
+[ "$entry" != "$(hash "$bin/herdr-standin")" ] || fail 'herdr-standin keyed by its output'
+grep -F "$(hash "$repo/suspend/herdr-shell") herdr-shell" "$record/installed-suspend" >/dev/null ||
+  fail 'herdr-shell not recorded'
+run > "$log"
+[ "$(build_count)" = 1 ] || fail 'an unchanged second run rebuilt the stand-in'
+assert_log 'suspend: 0 installed'
+assert_same "$case_dir/suspend-record" "$record/installed-suspend"
+assert_same "$case_dir/first-build" "$bin/herdr-standin"
+# Each source rebuilds it: the shared recipe module and a stand-in source.
+printf 'export const recipe = 2;\n' > "$repo/herdr/mods/tab-tree/recipes.js"
+run > "$log"
+[ "$(build_count)" = 2 ] || fail 'a recipe change did not rebuild the stand-in'
+entry2=$(awk '$2 == "herdr-standin" { print $1 }' "$record/installed-suspend")
+[ "$entry2" != "$entry" ] || fail 'the source hash did not change'
+printf 'import { recipe } from "../herdr/mods/tab-tree/recipes.js";\nexport const standin = 2;\n' > "$repo/suspend/standin.ts"
+run > "$log"
+[ "$(build_count)" = 3 ] || fail 'a stand-in source change did not rebuild the stand-in'
+# A test file and a Herdr file the stand-in does not import rebuild nothing.
+printf 'test\n' > "$repo/suspend/standin.test.ts"
+printf 'herdr-v2\n' > "$repo/herdr/mods/example/main.js"
+run > "$log"
+[ "$(build_count)" = 3 ] || fail 'a file outside the stand-in rebuilt it'
+# A deleted binary is built again without a source change.
+rm "$bin/herdr-standin"
+run > "$log"
+[ "$(build_count)" = 4 ] || fail 'a missing stand-in was not rebuilt'
+# A launcher change installs herdr-shell, and nothing is built.
+printf '# local\n' >> "$repo/suspend/herdr-shell"
+run > "$log"
+[ "$(build_count)" = 4 ] || fail 'a launcher change rebuilt the stand-in'
+assert_same "$repo/suspend/herdr-shell" "$bin/herdr-shell"
+echo 'ok - the stand-in is keyed by its source hash and rebuilt only when its sources change'
+
+fixture standin-broken
+suspend_sources
+fake_bun aot
+run > "$log"
+cp "$bin/herdr-standin" "$case_dir/first-build"
+cp "$record/installed-suspend" "$case_dir/suspend-record"
+printf 'export const standin = 2;\n' > "$repo/suspend/standin.ts"
+printf 'herdr-v2\n' > "$repo/herdr/mods/example/main.js"
+fake_bun broken
+run > "$log" 2>&1 || fail 'a failed build failed the install'
+assert_log 'building herdr-standin failed'
+assert_log 'fake build failure'
+assert_same "$case_dir/first-build" "$bin/herdr-standin"
+assert_same "$case_dir/suspend-record" "$record/installed-suspend"
+assert_same "$repo/herdr/mods/example/main.js" "$app/mods/example/main.js"
+[ -z "$(find "$bin" -name '*.install-tmp' -print)" ] || fail 'staging files remain'
+fake_bun aot
+run > "$log"
+[ "$(build_count)" = 1 ] || fail 'the next run did not retry the failed build'
+echo 'ok - a failed build keeps the installed stand-in and is retried on the next run'
+
 wait_same() {
   attempts=0
   until cmp -s "$1" "$2"; do
@@ -241,7 +388,7 @@ wait_log() {
 }
 fixture watch
 # exec avoids leaving the watched installer behind when the test kills its pid.
-(exec env -i PATH="$PATH" HOME="$home" XDG_STATE_HOME="$state" \
+(exec env -i PATH="$nobun_path" HOME="$home" XDG_STATE_HOME="$state" \
   sh "$repo/install.sh" --watch > "$log" 2>&1) &
 watch_pid=$!
 wait_log 'pi: 5 installed, 0 skipped'
@@ -267,7 +414,7 @@ echo 'ok - watch handles repeated same-size edits and renames in both trees'
 
 fixture watch-conditional
 rmdir "$home/.pi"
-(exec env -i PATH="$PATH" HOME="$home" XDG_STATE_HOME="$state" \
+(exec env -i PATH="$nobun_path" HOME="$home" XDG_STATE_HOME="$state" \
   sh "$repo/install.sh" --watch > "$log" 2>&1) &
 watch_pid=$!
 wait_log 'pi: skipped'
@@ -288,4 +435,34 @@ kill "$watch_pid"
 wait "$watch_pid" 2>/dev/null || :
 watch_pid=
 echo 'ok - watch activates existing Pi and never recreates a removed Pi home'
+
+wait_builds() {
+  attempts=0
+  until [ "$(build_count)" = "$1" ]; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 100 ] || fail "watch did not reach $1 builds (got $(build_count))"
+    kill -0 "$watch_pid" 2>/dev/null || fail 'watch exited'
+    sleep 0.1
+  done
+}
+fixture watch-standin
+suspend_sources
+fake_bun aot
+(exec env -i PATH="$run_path" HOME="$home" XDG_STATE_HOME="$state" \
+  sh "$repo/install.sh" --watch > "$log" 2>&1) &
+watch_pid=$!
+wait_log 'suspend: 2 installed'
+# Idle: the new binary and the manifest are not sources, so nothing rebuilds.
+sleep 2.5
+[ "$(build_count)" = 1 ] || fail "idle watch rebuilt the stand-in ($(build_count) builds)"
+printf 'export const standin = 2;\n' > "$repo/suspend/standin.ts"
+wait_builds 2
+printf '# edited\n' >> "$repo/suspend/herdr-shell"
+wait_same "$repo/suspend/herdr-shell" "$bin/herdr-shell"
+sleep 1.5
+[ "$(build_count)" = 2 ] || fail "watch rebuilt the stand-in after a launcher edit ($(build_count) builds)"
+kill "$watch_pid"
+wait "$watch_pid" 2>/dev/null || :
+watch_pid=
+echo 'ok - watch rebuilds the stand-in once per source change and never while idle'
 echo 'All installer tests passed.'
