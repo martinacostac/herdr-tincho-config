@@ -182,7 +182,10 @@ test("no helper gets a signal when the main program's SIGKILL fails", async () =
   assert.deepEqual(actions().filter(([command]) => command === "kill"), [["kill", "-KILL", "100"]]);
 });
 
-test("an agent inside a shell is recorded with root shell, and the shell gets SIGTERM (fact F3)", async () => {
+// Interactive bash and zsh ignore SIGTERM, and zsh turns SIGHUP into exit 1
+// (final). SIGKILL is a loss for every shell, and the kernel then sends the
+// agent in front SIGHUP, its clean shutdown (checked with bash, zsh, fish).
+test("an agent inside a shell is recorded with root shell, and the shell gets SIGKILL", async () => {
   reset();
   const s = createSuspender({ id: "a" });
   assert.deepEqual(await s.suspend("t8", { now: NOW }), { suspended: true });
@@ -190,7 +193,7 @@ test("an agent inside a shell is recorded with root shell, and the shell gets SI
   assert.deepEqual(labelOf(done[3]), { version: 1, agent: "claude", root: "shell", cwd: "/work/app", since: NOW });
   // The terminal's main program (fish, 200), never the agent in front (201),
   // and nothing else.
-  assert.deepEqual(done.slice(4), [["kill", "-TERM", "200"]]);
+  assert.deepEqual(done.slice(4), [["kill", "-KILL", "200"]]);
 });
 
 test("step 1 aborts when the agent is no longer unused, before anything changes", async () => {
@@ -365,7 +368,7 @@ test("with two copies, only one leads and acts", async () => {
   assert.deepEqual(actions(), []);
   await inWindow("one", () => a.pass(NOW));
   assert.deepEqual(suspendedAddresses(), ["t7", "t8"]);
-  assert.deepEqual(actions().filter(([c]) => c === "kill"), [["kill", "-KILL", "100"], ["kill", "-TERM", "101"], ["kill", "-TERM", "200"]]);
+  assert.deepEqual(actions().filter(([c]) => c === "kill"), [["kill", "-KILL", "100"], ["kill", "-TERM", "101"], ["kill", "-KILL", "200"]]);
 });
 
 test("a copy leads only once its own entry is published, and a stale or closed leader hands over", async () => {

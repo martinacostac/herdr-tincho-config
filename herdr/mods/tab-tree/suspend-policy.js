@@ -223,13 +223,15 @@ export function suspendSettings() {
 // The signal that ends the terminal's main program. hc treats a death by
 // signal as a loss, so a kept terminal starts its configured shell
 // (herdr-shell) in place; an exit with a code is final, and the terminal ends.
-// - root=shell: SIGTERM to the shell (fact F3: a loss; the agent inside exits
-//   cleanly on the shell's SIGHUP, its session saved).
-// - root=agent: SIGKILL. Pi (and maybe Claude) turns SIGTERM and SIGHUP into
-//   exit code 0, which would end the terminal; no program can catch SIGKILL.
-//   Its helpers (MCP servers) then get SIGTERM, so they don't outlive it.
+// SIGKILL in both cases, because no program can turn it into an exit code:
+// - root=shell: interactive bash and zsh ignore SIGTERM, and zsh turns SIGHUP
+//   into exit 1. With the shell gone, the kernel sends the agent in front
+//   SIGHUP, its clean shutdown (checked with bash, zsh and fish).
+// - root=agent: Pi (and maybe Claude) turns SIGTERM and SIGHUP into exit
+//   code 0. Its helpers (MCP servers) then get SIGTERM, so they don't
+//   outlive it.
 /** @type {Record<Root, string>} */
-const SIGNAL = { agent: "KILL", shell: "TERM" };
+const SIGNAL = { agent: "KILL", shell: "KILL" };
 
 /** @param {string} address @returns {Promise<Record<string, any> | null>} */
 async function coreTerminal(address) {

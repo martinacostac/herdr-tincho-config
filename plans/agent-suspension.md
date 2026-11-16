@@ -188,6 +188,7 @@ All five facts were checked on a disposable core, hc 0.1.21, Claude Code
 
 None of the five facts contradicts an agreed decision:
 
+- **Superseded (2026-11-16):** the policy now sends `SIGKILL` for both kinds of main program. Pi turns `SIGTERM`/`SIGHUP` into exit 0 (final, final review C1); interactive bash and zsh ignore `SIGTERM`, and zsh turns `SIGHUP` into exit 1. `SIGKILL` on a hosting shell is a loss for bash, zsh and fish, and the agent in front then receives `SIGHUP` (checked with a trap in each shell).
 - SIGTERM stays the signal for both kinds of main program. The F3 escape
   hatch (SIGKILL) is not needed.
 - F1 confirms user story 46.

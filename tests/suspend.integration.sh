@@ -13,7 +13,7 @@
 # steps with hc commands: re-check (with a process snapshot), keep, re-check
 # status and turn, set the suspension record, signal the main program
 # (SIGKILL for root=agent, then SIGTERM to every process under the agent in
-# the snapshot; SIGTERM to the shell for root=shell). Then it sends a message with
+# the snapshot; SIGKILL to the shell for root=shell). Then it sends a message with
 # plain `hc send` and checks that the message is the woken agent's first
 # prompt, that the address, name, labels, parent and child terminal did not change, that
 # nothing ran in a shell, that a send during the switch was refused as
@@ -306,13 +306,14 @@ suspend() {
   hc label "$t" "herdr.suspended=$(printf '%s' "$before" | record "$agent" "$found_root")" >/dev/null || die "hc label $t"
   # 5. End the main program. hc starts herdr-shell, which starts the stand-in.
   #    root=agent: SIGKILL, which no agent can turn into an exit code, then
-  #    SIGTERM to the processes under it. root=shell: SIGTERM to the shell.
+  #    SIGTERM to the processes under it. root=shell: SIGKILL to the shell
+  #    (interactive bash and zsh ignore SIGTERM); the agent in front gets SIGHUP.
   if [ "$found_root" = agent ]; then
     kill -KILL "$pid"
     # shellcheck disable=SC2086
     [ -z "$under_agent" ] || kill -TERM $under_agent 2>/dev/null || :
   else
-    kill -TERM "$pid"
+    kill -KILL "$pid"
   fi
   # While hc switches programs it shows no pid, and a plain send is refused.
   wait_until 5 "hc to see $t's program end" '[ "$(field "$t" "t.pid ?? 0")" != "$pid" ]'

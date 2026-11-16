@@ -389,9 +389,11 @@ How the agent's process ends depends on what hc started in the terminal:
   entry to its session file as it happens (`appendFileSync` in its session
   manager, read in its source), so an idle Pi loses nothing.
   `tests/suspend.integration.sh` checks both signals with a real Pi.
-- **An agent inside your shell**: the shell gets `SIGTERM`. hc counts that as
-  a lost program, and the agent exits cleanly with its session saved (fact F3
-  in the [plan](plans/agent-suspension.md)).
+- **An agent inside your shell** (fish, bash or zsh): the shell gets
+  `SIGKILL`. Interactive bash and zsh ignore `SIGTERM`, and zsh turns `SIGHUP`
+  into a normal exit, so only `SIGKILL` counts as a lost program for every
+  shell. With the shell gone, the agent in front receives `SIGHUP` and shuts
+  down cleanly, its session saved (checked with bash, zsh and fish).
 
 ### Suspension settings
 
