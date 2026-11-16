@@ -169,6 +169,7 @@ const TEXTS = {
   changed: "agent changed",
   failed: "hc command failed",
   closed: "tab tree closed",
+  repaired: "stale suspension label removed",
 };
 
 test("every reason has readable text, from the shared reasons and from a request's result", () => {

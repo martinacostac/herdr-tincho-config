@@ -46,6 +46,7 @@ const REASONS = {
   changed: "agent changed",
   failed: "hc command failed",
   closed: "tab tree closed",
+  repaired: "stale suspension label removed",
   "no-answer": "no answer from tab tree",
 };
 // Reasons the policy checks before the pin.

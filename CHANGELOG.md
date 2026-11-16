@@ -41,6 +41,23 @@ consolidated below.
 - Conflict-aware installer for Herdr configuration and Pi extensions, with
   atomic writes, separate installation manifests, configurable destinations,
   and backups when forcing an overwrite.
+- Suspension of unused agents: idle Claude and Pi agents are ended to free
+  memory while their terminals keep their address, labels and links. A
+  stand-in holds each suspended terminal and wakes the agent from its session
+  when a message arrives, when its tab stays focused for one second, or on
+  Enter; the messages become the first prompt. Configurable with
+  `tincho.suspend` (`after_minutes`, `helpers`; `false` or `0` turns automatic
+  suspension off).
+- Sidebar 💤 and "waking…" states, and **Suspend now** and **Never suspend**
+  items in the tab menu, with the reason when an agent cannot be suspended.
+- Claude launch options recorded in `herdr.claude-options` through an
+  allow-list, and replayed by recovery and waking.
+- Installer builds the stand-in with Bun (ahead-of-time compile, else the
+  standard compile, skipped without Bun), installs it with `herdr-shell`
+  outside `PATH`, and sets herdr-core's `shell` key, reporting a different
+  value as a conflict unless `--force` is given.
+- By-hand integration script for suspension on a disposable hc core
+  (`tests/suspend.integration.sh`).
 - Regression coverage for recovery, panel lifecycle, status controls, background
   jobs, and installer behavior.
 - Provenance documents and research notes covering command-palette limitations,

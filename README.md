@@ -24,8 +24,10 @@ herdr/            mirrors the Herdr app home (~/.config/herdr-app)
   themes/           catppuccin-latte.json, catppuccin-frappe.json
 pi/              mirrors Pi's agent directory (~/.pi/agent)
   extensions/       herdr-recovery/ (session metadata for the ↻ button)
+suspend/         the stand-in and herdr-shell (see Suspending unused agents)
 tests/           recovery and isolated installer tests
-install.sh       copies herdr/ and pi/ into their respective homes
+install.sh       copies herdr/ and pi/ into their respective homes,
+                 builds the stand-in
 ```
 
 `install.sh` puts every file under `herdr/` at the same path in the Herdr app
@@ -69,6 +71,7 @@ herdr-app status                                  # file and mod errors
 herdr-app shot /tmp/herdr.png                     # what the window shows
 node --test tests/*.test.mjs                      # Node 22.19+; no live sessions
 sh tests/install.test.sh                         # disposable homes; includes --watch
+sh tests/suspend.integration.sh                  # by hand only; disposable hc core
 ```
 
 Use one-shot installs while developing; no watcher needs to run between edits.
@@ -99,6 +102,10 @@ by hand in `~/.config/herdr-app/settings.json` on each machine:
 background for near-white or near-black. Without it, programs that draw
 ANSI 0 on Base or light text on a blue selection (Fresh's "system" theme)
 are hard to read.
+
+Optional: `"tincho.suspend"` in the same file (see
+[Suspending unused agents](#suspending-unused-agents)), and
+`restore_screen = true` in `~/.config/herdr-core/config.toml`.
 
 ## Keys
 
@@ -243,7 +250,11 @@ agent that terminal last ran, from `RECIPES` in `recipes.js`:
   Identity checks reject process changes during probes, and unchanged sessions
   skip label writes. Claude stays polled so same-process `/clear` and `/resume`
   changes are detected. Herdr has no atomic PID-conditional label operation,
-  so the final check-to-write race cannot be eliminated completely.
+  so the final check-to-write race cannot be eliminated completely. The
+  line also carries Claude's launch options (see
+  [Claude launch options](#claude-launch-options)).
+
+  Recovery never types into a suspended agent's terminal: ↻ isn't shown there.
 - `pi`: `pi --session '<absolute session file>'` plus supported launch options.
   The extension below records the exact conversation; an ID-only record uses
   `pi --session '<id>'` from the recorded working directory. Missing/invalid
@@ -324,6 +335,215 @@ metadata may remain. A conversation that never reached disk, was deleted, or
 ran with `--no-session` cannot be restored; the button opens the picker instead.
 This extension targets Pi's current `session_start` lifecycle (verified with
 Pi 1.5.0).
+
+## Suspending unused agents
+
+An idle agent still holds its memory (about 250 MB for a Pi agent, plus its
+MCP servers). `tab-tree` **suspends** unused agents: it ends the agent's
+process, but the terminal stays live with the same address, name, labels,
+parent and children. A small **stand-in** program holds the terminal. Other
+agents keep using plain `hc send`: the message wakes the agent and becomes its
+first prompt. Nothing in hc changes.
+
+The words used here are defined in [`GLOSSARY.md`](GLOSSARY.md). Why it works
+this way: [ADR 0001](docs/adr/0001-suspended-agents-reached-through-a-stand-in.md).
+The design and the facts checked for it: [`plans/agent-suspension.md`](plans/agent-suspension.md).
+
+### Unused agents
+
+An agent is suspended only when all of these hold:
+
+- It's resumable: Claude or Pi, with its session label
+  (`herdr.claude-session`) or record (`herdr.pi-recovery`).
+- It's `idle` or `done` for the threshold, counted from the later of its last
+  status change and the last time its tab was focused.
+- Its tab isn't the focused tab of any Herdr window.
+- It isn't `working` or `blocked`.
+- It isn't pinned (**Never suspend**).
+- It runs on this machine. Remote agents are never suspended.
+- It runs no processes of its own except helpers. A helper is a process whose
+  command line contains an entry of `helpers` (default `mcp`, which matches
+  the MCP servers under each Pi agent). A process under a helper counts as
+  part of it. A dev server, a watcher or a build keeps the agent awake.
+
+Child terminals don't count. They keep running when their parent is
+suspended, and a parent that waits on its children already counts as
+`working`.
+
+One copy of `tab-tree` acts, even with several windows open. Right before it
+suspends an agent, it reads the terminal again and stops if anything changed.
+Suspension happens only while the Herdr app is open.
+
+### Settings
+
+In `~/.config/herdr-app/settings.json` (set by hand, see [Settings](#settings)):
+
+```json
+"tincho.suspend": { "after_minutes": 30, "helpers": ["mcp"] }
+```
+
+These are the defaults when the key is missing. A missing or invalid field
+keeps its default. `"tincho.suspend": false` or `"after_minutes": 0` turns
+automatic suspension off. **Suspend now** still works then, with the same
+helpers.
+
+To see the agent's last screen above the stand-in's line, set
+`restore_screen = true` in `~/.config/herdr-core/config.toml`. hc's default is
+`false`, and the stand-in then shows only its line.
+
+### Suspend now and Never suspend
+
+Right-click an agent tab on this machine:
+
+- **Suspend now** skips the threshold. Every other rule still applies. The
+  item shows "Suspending…", then "Suspended" or "Can't suspend: <reason>"
+  (focused, working, blocked, background processes, pinned, not resumable,
+  remote terminal, suspension not installed, and so on). It can show the
+  reason before you click; click anyway to check again. With no answer for a
+  minute, it shows "no answer from tab tree".
+- **Never suspend** pins the agent (the label `herdr.never-suspend=1`). On a
+  pinned agent the item reads **Remove Never suspend**. From a shell:
+  `hc label t7 herdr.never-suspend=1`, and `hc label t7 herdr.never-suspend=`
+  to remove it.
+
+### What you see
+
+- In the sidebar, a suspended agent's row has a dimmed name and icon and 💤.
+  While the agent starts again, the row shows "waking…". A stand-in that
+  can't wake the agent shows "Needs you".
+- In the terminal: the agent's last screen (with `restore_screen`), then a
+  line like `💤 pi suspended at 14:05 · wakes on a message or when focused ·
+  Enter wakes it`.
+- For other agents, a suspended agent is an idle agent: `hc send --if idle`,
+  `hc wait` and `hc send --wait` work as usual.
+
+### What wakes an agent
+
+- **A message**: `hc send` from another agent, hc's own notes about a child,
+  or a line you type in the stand-in and confirm with Enter. Messages that
+  arrive within 500 ms of the first one go in together, as one first prompt.
+  The stand-in never runs what it receives.
+- **Focus**: its tab stays focused for 1 second. Stepping past tabs with ⌘P
+  or the next-agent command wakes nothing.
+- **Enter** on an empty line in the stand-in, also through `hc attach` from a
+  plain terminal. The agent wakes with no prompt.
+
+The agent starts from its exact session, in its recorded folder, with its
+launch options. An agent that ran inside your shell returns to a shell prompt
+when you exit it. An agent that hc started directly ends its terminal, as
+before.
+
+A message sent while the terminal switches to the stand-in is refused by hc
+as `unavailable`. The sender can send it again.
+
+When the session is gone (Pi's file is missing or has another id, or Claude
+has no session id), the stand-in doesn't wake the agent. It saves the
+messages in `${XDG_STATE_HOME:-~/.local/state}/herdr-tincho-config/undelivered/`,
+shows the file's path and reports `blocked`, so hc tells the parent.
+
+### Claude launch options
+
+Recovery and waking start Claude with the options it was started with:
+`--resume` alone doesn't restore the model. Every 10 seconds, with the session
+id, the mod reads Claude's command line, keeps only known reusable options,
+and stores them in the `herdr.claude-options` label. ↻ then types, for
+example, `claude --model haiku --resume '<id>'`. Without options the line is
+the same as before.
+
+- Kept: `--model`, `--permission-mode`, `--effort`, `--fallback-model`,
+  `--agent`, `--setting-sources`, `--plugin-dir` and a few more with one
+  value; switches such as `--dangerously-skip-permissions` and `--verbose`;
+  the lists `--add-dir`, `--allowed-tools`, `--disallowed-tools` and `--tools`,
+  only when another option or `--` follows them (Claude takes a trailing
+  prompt into a list). Relative folders become absolute.
+- Never kept: prompts, system prompts, `--settings`, `--agents`,
+  `--mcp-config` (they can hold credentials), `--file`, `--betas`, and session
+  selectors (`--continue`, `--session-id`, `--name`).
+- An unknown option, or one with an optional value (`--resume`, `--debug`,
+  `--worktree`, ...), stops capture. The words after it are dropped.
+
+### Restarts, crashes and repairs
+
+- Suspended agents stay suspended through `hc server stop` and the next core
+  start (checked on a disposable core, fact F1). The terminal keeps its
+  address and labels, and starts the stand-in again. A reboot goes through
+  the same core start.
+- Suspension keeps the terminal (`hc keep`). If the agent crashes after it
+  woke, the terminal stays, with a shell and ↻.
+- A live agent never shows 💤. When a terminal keeps the suspension label but
+  an agent runs in it (a failed step, or a label set by hand), `tab-tree`
+  removes the label after 60 s. An open menu then says "Can't suspend: stale
+  suspension label removed". A "waking…" that no agent ends clears after 30 s.
+
+### Install
+
+`./install.sh` with Bun on `PATH`:
+
+- Builds the stand-in (`suspend/build.sh`) with Bun's small ahead-of-time
+  compile (`bun compile`, canary builds only today). Without it, it uses
+  `bun build --compile --minify` (stable Bun: a bit more memory, much larger
+  on disk). An idle stand-in uses about 7.5 MB. Without Bun it prints
+  `suspend: skipped (no bun)` and leaves hc's `shell` setting alone.
+- Installs `herdr-standin` and `herdr-shell` into
+  `${XDG_DATA_HOME:-~/.local/share}/herdr-tincho-config/bin/`, which is not
+  on `PATH`.
+- Records them in the `installed-suspend` manifest (next to `installed`), by
+  the hash of their sources. It rebuilds only when a source changes or the
+  binary is missing. Upgrading Bun doesn't rebuild: delete the installed
+  `herdr-standin` to get a build with the new Bun. A failed build keeps the
+  old binary and is tried again on the next run.
+- Sets `shell = ["<bin>/herdr-shell"]` in
+  `${XDG_CONFIG_HOME:-~/.config}/herdr-core/config.toml` and keeps every other
+  key. A different `shell` value is reported as a conflict and kept;
+  `--force` replaces it and keeps the old file as `config.toml.orig`. A file
+  it can't read (a multi-line string, for example) is reported and never
+  edited: set the line by hand. hc uses the new shell for programs it starts
+  after that; running programs keep running.
+
+`herdr-shell` and `herdr-standin` are program files: a new version replaces
+them even when they were changed on this machine.
+
+Every new terminal starts through `herdr-shell`. It reads its terminal's
+labels with `hc get` and starts the stand-in when the terminal is suspended,
+else your `$SHELL` (`/bin/sh` when unset). While hc restarts, it tries again
+for about 2 s. On any other error it shows the error and waits for Enter. It
+never starts a shell unless hc said the terminal isn't suspended. Nothing is
+suspended ("suspension not installed") until both programs are installed and
+`herdr-shell` is hc's `shell`.
+
+### Idle work
+
+- One 15 s pass in each `tab-tree` copy; only the leading copy acts. It
+  starts no process unless an agent is past its threshold.
+- A 60 s heartbeat in Herdr's shared state keeps the leader choice. Every mod
+  re-renders then.
+- One 1 s timer per focused suspended tab, cancelled when the focus moves.
+- About 15 ms per new terminal for `herdr-shell`'s label check.
+
+### Known limits
+
+- Automatic suspension happens only while the Herdr app is open. Focus times
+  are kept in memory, so after an app restart only the status time counts.
+- A message pasted milliseconds before the signal can be lost. Preventing
+  that needs an hc change.
+- Unsent text typed into an agent and left past the threshold is lost.
+- Every new terminal pays about 15 ms for the label check.
+- Bun's small ahead-of-time compile is experimental and canary only today.
+  The standard compile covers stable Bun.
+- Only Claude and Pi agents with session labels on this machine are
+  suspended.
+- Not checked: a first-run Claude dialog (folder trust) during a wake may
+  drop the first prompt. Claude then reports `blocked`, and hc tells the
+  parent. A folder that already has a session is already trusted.
+
+### Checking it by hand
+
+`sh tests/suspend.integration.sh`, from a normal terminal outside an agent
+sandbox, builds the stand-in and runs a disposable hc core under `/tmp` with
+fake Claude and Pi agents. It suspends both, sends a message to each, and
+checks the first prompt, the address, labels, parent and child, and that
+nothing ran in a shell. It never touches your core or agents. It isn't part
+of `node --test`.
 
 ## Mod: `tab-picker`
 
