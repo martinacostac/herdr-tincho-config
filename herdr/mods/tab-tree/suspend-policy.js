@@ -4,6 +4,7 @@
 
 import { settings, focused, panes, exec } from "herdr";
 import { SESSION, PI_RECOVERY, piRecovery } from "./recipes.js";
+import { isClaude } from "./claude-polling.js";
 
 export const NEVER_SUSPEND = "herdr.never-suspend";
 
@@ -15,11 +16,10 @@ const printable = (s) => typeof s === "string" && s.length > 0 && !/[\x00-\x1f\x
 // label: that describes an agent the terminal may have lost.
 /** @param {Record<string, any>} t @returns {"claude" | "pi" | null} */
 function agentOf(t) {
-  const app = t?.report?.app ?? (typeof t?.status === "object" ? t.status?.app : null);
+  if (isClaude(t)) return "claude";
+  const app = t?.report?.app ?? t?.status?.app;
   const key = typeof app === "string" && app ? app : t?.program?.agent ? t.program.key : null;
-  if (/^(claude|claude-code)$/i.test(key ?? "")) return "claude";
-  if (/^pi$/i.test(key ?? "")) return "pi";
-  return null;
+  return /^pi$/i.test(key ?? "") ? "pi" : null;
 }
 
 // Its session, so a wake continues the same conversation (never a picker).
@@ -46,8 +46,8 @@ const statusOf = (t) => typeof t?.status === "string" ? t.status : t?.status?.st
 // Why an agent is not an unused agent, one reason per rule, checked in this
 // order: automatic suspension is off, a remote terminal, not resumable,
 // pinned, in the focused tab, working, blocked, not idle (no agent status),
-// idle for less than the threshold, a descendant process that is not a helper,
-// and a process table that cannot be read.
+// idle for less than the threshold (or no status time), a process table that
+// cannot be read, and a descendant process that is not a helper.
 /** @typedef {"off" | "remote" | "not-resumable" | "pinned" | "focused" | "working" | "blocked" | "not-idle" | "recent" | "background" | "processes-unknown"} Reason */
 /** @typedef {{ unused: true, agent: "claude" | "pi" } | { unused: false, reason: Reason }} Verdict */
 
@@ -83,9 +83,9 @@ export async function unusedAgent(terminal, { now = Date.now(), focusedAt = null
     const since = Math.max(terminal.status_ms, Number.isFinite(focusedAt) ? focusedAt : -Infinity);
     if (now - since < config.afterMinutes * MINUTE) return { unused: false, reason: "recent" };
   }
-  const helpers = await onlyHelpers(terminal.foreground?.pid, config.helpers);
-  if (helpers === null) return { unused: false, reason: "processes-unknown" };
-  if (!helpers) return { unused: false, reason: "background" };
+  const allHelpers = await onlyHelpers(terminal.foreground?.pid, config.helpers);
+  if (allHelpers === null) return { unused: false, reason: "processes-unknown" };
+  if (!allHelpers) return { unused: false, reason: "background" };
   return { unused: true, agent };
 }
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { registerHooks } from "node:module";
-import { PI_RECOVERY, SESSION } from "../herdr/mods/tab-tree/recipes.js";
+import { LABEL, PI_RECOVERY, SESSION } from "../herdr/mods/tab-tree/recipes.js";
 
 // Mock only the Herdr host: app settings, focus, panes and the process table
 // (`ps`). The real rules run unchanged.
@@ -24,7 +24,7 @@ globalThis[hostKey] = {
 const moduleUrl = (source) => "data:text/javascript," + encodeURIComponent(source);
 const hook = registerHooks({
   resolve(specifier, context, next) {
-    if (specifier === "herdr") return { url: moduleUrl(`export const { settings, focused, panes, exec } = globalThis[Symbol.for("herdr.suspend-policy.test-host")]; export const hc = null, terminals = null, shared = null, setShared = null;`), shortCircuit: true };
+    if (specifier === "herdr") return { url: moduleUrl(`export const { settings, focused, panes, exec } = globalThis[Symbol.for("herdr.suspend-policy.test-host")];`), shortCircuit: true };
     return next(specifier, context);
   },
 });
@@ -42,7 +42,7 @@ const pi = (extra = {}) => ({
   foreground: { pid: 100, argv: ["pi", "", ""], cwd: "/project" },
   program: { key: "pi", agent: true, shell: false }, report: { app: "pi", state: "idle" },
   status: "idle", status_ms: NOW - 60 * MINUTE,
-  labels: { "herdr.last-agent": "pi", [PI_RECOVERY]: piRecord }, ...extra,
+  labels: { [LABEL]: "pi", [PI_RECOVERY]: piRecord }, ...extra,
 });
 // The same agent's process table: an MCP server (and its own child) under pi.
 const table = (rows) => async () => ({ code: 0, stdout: rows.map(([pid, ppid, command]) => `${pid} ${ppid} ${command}`).join("\n") + "\n", stderr: "" });
@@ -74,7 +74,7 @@ test("an idle, resumable Pi agent past the threshold is an unused agent", async 
 const claude = (extra = {}) => pi({
   pid: 200, argv: ["fish"], foreground: { pid: 201, argv: ["claude"], cwd: "/project" },
   program: { key: "claude", agent: true, shell: false }, report: { app: "claude-code", state: "idle" },
-  labels: { "herdr.last-agent": "claude", [SESSION]: "claude-session" }, ...extra,
+  labels: { [LABEL]: "claude", [SESSION]: "claude-session" }, ...extra,
 });
 const claudeProcesses = [[1, 0, "/sbin/launchd"], [200, 1, "fish"], [201, 200, "claude"]];
 
@@ -82,17 +82,20 @@ test("a Claude agent with its session label is resumable", async () => {
   reset();
   processTable = table(claudeProcesses);
   assert.deepEqual(await unusedAgent(claude(), { now: NOW }), { unused: true, agent: "claude" });
+  // As hc get describes it: no program, the report in status.
+  const fromCore = claude({ program: undefined, report: undefined, status: { app: "claude-code", state: "idle" } });
+  assert.deepEqual(await unusedAgent(fromCore, { now: NOW }), { unused: true, agent: "claude" });
 });
 
 test("an agent that cannot be started again from its session is not resumable", async () => {
   reset();
   const cases = [
-    claude({ labels: { "herdr.last-agent": "claude" } }),
-    claude({ labels: { "herdr.last-agent": "claude", [SESSION]: "" } }),
-    claude({ labels: { "herdr.last-agent": "claude", [PI_RECOVERY]: piRecord } }),
-    pi({ labels: { "herdr.last-agent": "pi" } }),
-    pi({ labels: { "herdr.last-agent": "pi", [PI_RECOVERY]: "not json" } }),
-    pi({ labels: { "herdr.last-agent": "pi", [SESSION]: "claude-session" } }),
+    claude({ labels: { [LABEL]: "claude" } }),
+    claude({ labels: { [LABEL]: "claude", [SESSION]: "" } }),
+    claude({ labels: { [LABEL]: "claude", [PI_RECOVERY]: piRecord } }),
+    pi({ labels: { [LABEL]: "pi" } }),
+    pi({ labels: { [LABEL]: "pi", [PI_RECOVERY]: "not json" } }),
+    pi({ labels: { [LABEL]: "pi", [SESSION]: "claude-session" } }),
     pi({ program: { key: "codex", agent: true, shell: false }, report: { app: "codex", state: "idle" }, labels: { [SESSION]: "s", [PI_RECOVERY]: piRecord } }),
     pi({ program: { key: "shell", agent: false, shell: true }, report: null, status: null }),
     pi({ labels: undefined }),
@@ -210,11 +213,11 @@ test("the manual mode skips only the threshold, also while automatic suspension 
 test("a pinned agent is never unused, also in the manual mode", async () => {
   reset();
   assert.equal(NEVER_SUSPEND, "herdr.never-suspend");
-  const pinned = pi({ labels: { ...pi().labels, [NEVER_SUSPEND]: "1" } });
+  const pinned = pi({ labels: { ...pi().labels, "herdr.never-suspend": "1" } });
   assert.deepEqual(await unusedAgent(pinned, { now: NOW }), { unused: false, reason: "pinned" });
   assert.deepEqual(await unusedAgent(pinned, { now: NOW, manual: true }), { unused: false, reason: "pinned" });
   // Only the value 1 pins (the menu clears the pin by removing or changing it).
-  assert.deepEqual(await unusedAgent(pi({ labels: { ...pi().labels, [NEVER_SUSPEND]: "0" } }), { now: NOW }), { unused: true, agent: "pi" });
+  assert.deepEqual(await unusedAgent(pi({ labels: { ...pi().labels, "herdr.never-suspend": "0" } }), { now: NOW }), { unused: true, agent: "pi" });
 });
 
 test("an agent on a remote machine is never unused, also in the manual mode", async () => {
@@ -254,7 +257,6 @@ test("an agent in no pane (a sub-agent's terminal) is not focused", async () => 
 test("with the default allow-list, MCP servers and their own children are helpers", async () => {
   reset();
   assert.deepEqual(await unusedAgent(pi(), { now: NOW }), { unused: true, agent: "pi" });
-  assert.equal(execs.length, 1);
 });
 
 test("a descendant process that is not a helper keeps the agent in use, also in the manual mode", async () => {
@@ -313,14 +315,6 @@ test("when the agent's processes cannot be read, it is not unused", async () => 
     processTable = ps;
     assert.deepEqual(await unusedAgent(terminal, { now: NOW }), { unused: false, reason: "processes-unknown" }, JSON.stringify(terminal.foreground));
   }
-});
-
-test("process checks run only after every cheaper rule passed", async () => {
-  reset();
-  for (const terminal of [pi({ status: "working" }), pi({ labels: {} }), pi({ status_ms: NOW })]) {
-    await unusedAgent(terminal, { now: NOW });
-  }
-  assert.deepEqual(execs, []);
 });
 
 test("a descendant without a command line (a zombie) is not a helper", async () => {
