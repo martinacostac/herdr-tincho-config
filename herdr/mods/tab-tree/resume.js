@@ -1,12 +1,12 @@
 // Bringing an agent back in a terminal that lost it (hc server stop, a crash,
 // a reboot). herdr-core keeps nothing of the program it lost: the mod labels
 // each terminal with the agent it last ran (LABEL, kept by the core across
-// restarts), and RECIPES says how each agent resumes.
+// restarts), and recipes.js says how each agent resumes.
 
 import { hc, exec } from "herdr";
 import { isClaude, processIdentity } from "./claude-polling.js";
 
-import { LABEL, SESSION, PI_RECOVERY, RECIPES, piRecovery } from "./recipes.js";
+import { LABEL, SESSION, PI_RECOVERY, piRecovery, holdsPiSession, recoveryLine } from "./recipes.js";
 export { LABEL, SESSION, RECIPES } from "./recipes.js";
 
 // Types a command line into the terminal's shell, so the person's own agent
@@ -79,7 +79,7 @@ export function createRecovery() {
     // Already-issued commands cannot be recalled; forbid every follow-up.
     close() { closed = true; queue = Promise.resolve(); },
     recover(cx, address, agent, labels, tab) {
-      if (agent !== "pi") return enqueue(() => attempt(cx, address, RECIPES[agent]({ session: labels[SESSION], tab }), check));
+      if (agent !== "pi") return enqueue(() => attempt(cx, address, recoveryLine(agent, labels, { tab }), check));
       // Pi must not use Claude's report timeout and /exit retry: its session
       // picker can wait indefinitely. Send once, only while still at a shell.
       return enqueue(async () => {
@@ -90,15 +90,12 @@ export function createRecovery() {
           // header, including its ID, so replaced files cannot resume another one.
           const file = await exec("sh", ["-c", 'test -f "$1" && head -c 4096 "$1"', "sh", recovery.sessionFile]).catch(() => null);
           check();
-          try {
-            const header = file?.code === 0 ? JSON.parse(file.stdout.split("\n")[0]) : null;
-            picker = header?.type !== "session" || header?.id !== recovery.sessionId;
-          } catch { picker = true; }
+          picker = file?.code !== 0 || !holdsPiSession(file.stdout, recovery.sessionId);
         }
         const current = await info(address);
         check();
         if (!current || current.state !== "live" || !atShell(current)) return;
-        await send(address, RECIPES.pi({ recovery, picker }));
+        await send(address, recoveryLine("pi", labels, { picker }));
       });
     },
   };
