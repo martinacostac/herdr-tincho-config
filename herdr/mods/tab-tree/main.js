@@ -2,7 +2,7 @@
 // primary pane (the first one in its split tree); panes split off it nest
 // under it, following who was split from whom. Each row says what runs there:
 // an agent (with its status), an idle shell, or a program (nvim, lazygit, ...).
-// Hover a tab back at a shell prompt for ↻: it resumes the agent the terminal
+// Hover a tab back at a shell prompt for ↻: it recovers the agent the terminal
 // last ran (resume.js). No record of one, no button.
 // A suspended agent's tab shows a dimmed name and 💤, and "waking…" while its
 // stand-in wakes it; it never offers ↻.
@@ -278,19 +278,20 @@ export default class TabTree extends View {
   // agent reports its own status (the report outlives the stand-in's
   // replacement by the agent, fact F5), "suspended" while the suspension label
   // is set (herdr-shell runs before the stand-in reports), else null.
-  suspendState(p) {
+  heldState(p) {
     if (!p.terminal) return null;
     if (p.app === STANDIN_APP && p.status === "working") return "waking";
     return Object.hasOwn(this.labels.get(p.terminal) ?? {}, SUSPENDED) ? "suspended" : null;
   }
 
-  // Where a status goes: "waking…" or 💤 for a terminal a stand-in holds (a
-  // stand-in that cannot wake reports blocked: that shows as usual).
-  // narrow: the rail has no room for words, so waking shows the spinner.
-  suspendStatus(t, p, state, narrow) {
-    if (state === "waking") return narrow ? this.status(t, "working") : div().flex_none().text_size(11.5).text_color(t.working).child("waking…");
-    if (state === "suspended" && p.status !== "blocked") return div().flex_none().text_size(narrow ? 10 : 11.5).child("💤");
-    return null;
+  // What a row shows where its status goes: "waking…" or 💤 for a terminal a
+  // stand-in holds (held: heldState()), else the status st. A stand-in that
+  // cannot wake reports blocked: that shows as usual. narrow: the rail has no
+  // room for words, so waking shows the spinner.
+  heldStatus(t, p, held, st, narrow = false) {
+    if (held === "waking") return narrow ? this.status(t, "working") : div().flex_none().text_size(11.5).text_color(t.working).child("waking…");
+    if (held === "suspended" && p.status !== "blocked") return div().flex_none().text_size(narrow ? 10 : 11.5).child("💤");
+    return this.status(t, st) ?? div();
   }
 
   // name: what runs there; detail: where, or what it says about itself.
@@ -312,9 +313,11 @@ export default class TabTree extends View {
     return { k, name: p.program?.name || title || "program", detail: telling ? title : folder(p.cwd) };
   }
 
-  glyph(t, p, k, size) {
-    return icon(p.program, size, k === "shell" ? t.dim : t.foreground)
-      ?? svg(`${ICONS}/${k === "mod" ? "square" : "terminal"}.svg`).size(size).flex_none().text_color(t.dim);
+  // dim: a suspended agent's icon, faded like its name.
+  glyph(t, p, k, size, dim = false) {
+    return (icon(p.program, size, k === "shell" ? t.dim : t.foreground)
+      ?? svg(`${ICONS}/${k === "mod" ? "square" : "terminal"}.svg`).size(size).flex_none().text_color(t.dim))
+      .when(dim, (el) => el.opacity(0.5));
   }
 
   // A tab's name and detail as its row shows them (the picker shows the same).
@@ -358,20 +361,19 @@ export default class TabTree extends View {
     const { d, name, detail } = this.label(tab, root, g, wt);
     const on = s.active && tab.active;
     const kidsOpen = root.kids.length > 0 && !this.folded.has(tab.id);
-    const held = this.suspendState(p);
-    // Back at a shell prompt: ↻ resumes the agent the terminal last ran. Never
+    const held = this.heldState(p);
+    // Back at a shell prompt: ↻ recovers the agent the terminal last ran. Never
     // in a stand-in: it is the main program, so it looks like a shell.
     const local = !held && d.k === "shell" && p.terminal && !p.terminal.includes("/");
     const last = local ? this.labels.get(p.terminal)?.[LABEL] : null;
     const agent = last && RECIPES[last] ? last : null;
     const hovered = this.hovered === tab.id;
-    const glyph = (size) => this.glyph(t, p, d.k, size).when(held === "suspended", (el) => el.opacity(0.5));
     if (collapsed) {
       return h_flex().id(`tab-${tab.id}`).h(28).flex_none().justify_center().items_center().gap(3).rounded(7)
         .when(on, (el) => el.bg(t.selected)).hover((el) => el.bg(t.hover))
         .on_click(() => run("tab.select", { id: tab.id }))
-        .child(glyph(15))
-        .child(this.suspendStatus(t, p, held, true) ?? this.status(t, tab.status) ?? div());
+        .child(this.glyph(t, p, d.k, 15, held === "suspended"))
+        .child(this.heldStatus(t, p, held, tab.status, true));
     }
     return h_flex()
       .id(`tab-${tab.id}`)
@@ -400,7 +402,7 @@ export default class TabTree extends View {
         .when(root.kids.length > 0, (el) => el.hover((el) => el.text_color(t.foreground))
           .on_click((_e, cx) => { cx.stop_propagation(); this.fold(tab.id, cx); })
           .child(svg(`${ICONS}/chevron-${kidsOpen ? "down" : "right"}.svg`).size(11))))
-      .child(glyph(16))
+      .child(this.glyph(t, p, d.k, 16, held === "suspended"))
       .child(h_flex().flex_1().min_w(0).gap(6).items_center()
         .child(div().flex_shrink(1).min_w(0).max_w(190).truncate().text_color(held ? t.dim : d.k === "shell" && !tab.named ? t.muted : t.foreground).child(name))
         .when(Boolean(this.tagChip(t, p.terminal)), (el) => el.child(this.tagChip(t, p.terminal)))
@@ -423,7 +425,7 @@ export default class TabTree extends View {
         .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
         .on_click((_e, cx) => { cx.stop_propagation(); run("tab.close", { id: tab.id }); })
         .child(svg(`${ICONS}/x.svg`).size(12))))
-      .when(!hovered, (el) => el.child(this.suspendStatus(t, p, held, false) ?? this.status(t, p.status) ?? div()));
+      .when(!hovered, (el) => el.child(this.heldStatus(t, p, held, p.status)));
   }
 
   count(n) {
@@ -436,7 +438,7 @@ export default class TabTree extends View {
   paneRow(t, c, n, lines) {
     const p = n.p;
     const d = this.describe(p);
-    const held = this.suspendState(p);
+    const held = this.heldState(p);
     const git = p.terminal ? this.gitOf(c.s.machine, p.cwd, c.cx) : null;
     const wt = git && (git.worktree ?? null) !== c.wt ? git.worktree ?? base(git.root) : null;
     if (d.k === "shell" && (same(d.name, c.g) || same(d.name, git?.worktree))) d.name = p.program.name;
@@ -460,13 +462,13 @@ export default class TabTree extends View {
       .children(lines.map((l) => div().self_start().mt(-4).w(9).h(17).mr(4).flex_none()
         .when(Boolean(l), (el) => el.border_l(1.5).border_color(t.input))
         .when(l === "└" || l === "├", (el) => el.border_b(1.5).rounded_bl(6))))
-      .child(div().mr(7).child(this.glyph(t, p, d.k, 14).when(held === "suspended", (el) => el.opacity(0.5))))
+      .child(div().mr(7).child(this.glyph(t, p, d.k, 14, held === "suspended")))
       .child(h_flex().flex_1().min_w(0).gap(6).items_center()
         .child(div().flex_shrink(0).max_w(130).truncate().text_color(held ? t.dim : p.focused ? t.foreground : t.muted).child(d.name))
         .when(Boolean(this.tagChip(t, p.terminal)), (el) => el.child(this.tagChip(t, p.terminal)))
         .when(Boolean(wt), (el) => el.child(div().flex_none().text_size(11).text_color(t.muted).child(`- ${wt}`)))
         .when(Boolean(d.detail), (el) => el.child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(d.detail))))
-      .child(this.suspendStatus(t, p, held, false) ?? this.status(t, p.status) ?? div());
+      .child(this.heldStatus(t, p, held, p.status));
   }
 
   // Every pane under the tab at one level, depth first, however deep its split

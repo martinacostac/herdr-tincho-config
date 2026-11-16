@@ -215,9 +215,21 @@ test("step 5 reports a signal that could not be sent, and removes the label from
   reset();
   failing.add("kill");
   assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: false, reason: "failed" });
-  assert.deepEqual(actions().map((c) => c[0] === "kill" ? "kill" : c[1]), ["get", "keep", "get", "label", "kill", "label"]);
+  assert.deepEqual(actions().map((c) => c[0] === "kill" ? "kill" : c[1]), ["get", "keep", "get", "label", "kill", "get", "label"]);
   // Without the label, the sidebar shows the live agent, not a suspended one.
   assert.deepEqual(actions().at(-1), ["hc", "label", "t7", `${SUSPENDED}=`]);
+});
+
+test("step 5 keeps the label when the signal failed because the main program already ended", async () => {
+  for (const gone of [piCore({ pid: 400, foreground: { pid: 400, argv: ["herdr-standin"], cwd: "/" } }), piCore({ state: "lost" })]) {
+    reset();
+    failing.add("kill");
+    // Steps 1 and 3 see the agent; after the failed signal, hc already
+    // started herdr-shell (a new main program), which reads the label.
+    core.t7 = [piCore(), piCore(), gone];
+    assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: false, reason: "failed" });
+    assert.deepEqual(actions().map((c) => c[0] === "kill" ? "kill" : c[1]), ["get", "keep", "get", "label", "kill", "get"], gone.state);
+  }
 });
 
 test("a closed copy stops between steps", async () => {
