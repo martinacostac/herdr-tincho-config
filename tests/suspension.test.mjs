@@ -1,0 +1,682 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { registerHooks } from "node:module";
+import { execFile } from "node:child_process";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, chmodSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { LABEL, PI_RECOVERY, SESSION, SUSPENDED } from "../herdr/mods/tab-tree/recipes.js";
+
+// Mock only the Herdr host and the processes it starts: hc, ps and kill are
+// fakes; `sh` runs for real against a disposable home, so the installed check
+// sees real files. Each copy of the mod runs in its own window: `window`
+// names the window whose focus focused() returns.
+let appSettings;
+let windows; // window name -> focused() value
+let window;
+let paneList;
+let terminalList;
+let store; // shared state
+let core; // address -> hc get answers (or functions that give one), in order; the last one repeats
+let failing; // hc or exec commands that fail: "keep", "label", "keys", "kill"
+let processRows;
+let calls;
+let home;
+let shRuns = 0; // how many times `sh` ran (the installed check)
+let shEnv; // more environment for `sh`, as the app's real environment would have it
+const hostKey = Symbol.for("herdr.suspension.test-host");
+
+const runSh = (args, env) => new Promise((resolve) => {
+  execFile("sh", args, { env }, (error, stdout, stderr) => resolve({ code: error ? (typeof error.code === "number" ? error.code : 1) : 0, stdout, stderr }));
+});
+
+globalThis[hostKey] = {
+  settings: () => structuredClone(appSettings),
+  focused: () => structuredClone(windows[window] ?? null),
+  panes: () => structuredClone(paneList),
+  terminals: () => structuredClone(terminalList),
+  shared: (key) => structuredClone(store.get(key)),
+  setShared: (key, value) => { store.set(key, structuredClone(value)); return null; },
+  readTextFile: async (path) => { try { return readFileSync(path, "utf8"); } catch { return null; } },
+  exec: async (command, args) => {
+    if (command === "sh") shRuns++;
+    if (command === "sh") return runSh(args, { HOME: home, PATH: process.env.PATH, ...shEnv });
+    calls.push([command, ...args]);
+    if (command === "ps") return { code: 0, stdout: processRows.map((r) => r.join(" ")).join("\n") + "\n", stderr: "" };
+    if (command === "kill") return failing.has("kill") ? { code: 1, stdout: "", stderr: "kill: no such process" } : { code: 0, stdout: "", stderr: "" };
+    throw new Error(`unexpected exec: ${command}`);
+  },
+  hc: async (args) => {
+    calls.push(["hc", ...args]);
+    const [command, address] = args;
+    if (failing.has(command)) return { code: 3, stdout: "", stderr: `{"error":{"kind":"not_found"}}` };
+    if (command === "get") {
+      const answers = core[address];
+      if (!answers?.length) return { code: 3, stdout: "", stderr: `{"error":{"kind":"not_found"}}` };
+      const next = answers.length > 1 ? answers.shift() : answers[0];
+      const answer = typeof next === "function" ? next() : next;
+      return { code: 0, stdout: JSON.stringify(answer) + "\n", stderr: "" };
+    }
+    if (["keep", "label", "keys"].includes(command)) return { code: 0, stdout: "{}\n", stderr: "" };
+    throw new Error(`unexpected hc: ${args.join(" ")}`);
+  },
+};
+const moduleUrl = (source) => "data:text/javascript," + encodeURIComponent(source);
+const hook = registerHooks({
+  resolve(specifier, context, next) {
+    if (specifier === "herdr") return { url: moduleUrl(`export const { settings, focused, panes, terminals, shared, setShared, readTextFile, exec, hc } = globalThis[Symbol.for("herdr.suspension.test-host")];`), shortCircuit: true };
+    return next(specifier, context);
+  },
+});
+const policy = await import("../herdr/mods/tab-tree/suspend-policy.js");
+hook.deregister();
+const { createSuspender, SUSPEND_REQUESTS, SUSPEND_STATE } = policy;
+
+const MINUTE = 60_000;
+const NOW = 1_800_000_000_000;
+const piRecord = JSON.stringify({ version: 1, sessionId: "session-1", sessionFile: "/sessions/one.jsonl", cwd: "/project", args: [] });
+
+// t7: a Pi agent that hc started directly (its main program is the agent).
+// t8: a Claude agent inside fish (the shell is the main program). Both idle
+// for an hour, each in its own tab; tab-1 (t1, a shell) is focused.
+const piCore = (extra = {}) => ({
+  address: "t7", state: "live", pid: 100, argv: ["pi"], keep: false, turn: 4,
+  foreground: { pid: 100, argv: ["pi", "", ""], cwd: "/project" },
+  status: { app: "pi", state: "idle" }, status_ms: NOW - 60 * MINUTE,
+  labels: { [LABEL]: "pi", [PI_RECOVERY]: piRecord }, ...extra,
+});
+const claudeCore = (extra = {}) => ({
+  address: "t8", state: "live", pid: 200, argv: ["fish"], keep: false, turn: 9,
+  foreground: { pid: 201, argv: ["claude", "--model", "haiku"], cwd: "/work/app" },
+  status: { app: "claude-code", state: "idle" }, status_ms: NOW - 60 * MINUTE,
+  labels: { [LABEL]: "claude", [SESSION]: "claude-session" }, ...extra,
+});
+// As terminals() describes the same terminal: the status as a word, the
+// report beside it, and the program table's entry.
+const listed = (j) => ({
+  ...j, status: j.status?.state ?? null, report: j.status,
+  program: { key: j.status?.app === "claude-code" ? "claude" : j.status?.app ?? "shell", agent: Boolean(j.status), shell: !j.status },
+});
+const shellCore = { address: "t1", state: "live", pid: 50, argv: ["fish"], turn: 0, foreground: { pid: 50, argv: ["fish"], cwd: "/" }, status: null, status_ms: null, labels: {} };
+
+function makeHome({ standin = true, shell = true, config } = {}) {
+  if (home) rmSync(home, { recursive: true, force: true });
+  home = mkdtempSync(join(tmpdir(), "suspension-test-"));
+  const bin = join(home, ".local/share/herdr-tincho-config/bin");
+  mkdirSync(bin, { recursive: true });
+  for (const [name, present] of [["herdr-standin", standin], ["herdr-shell", shell]]) {
+    if (!present) continue;
+    writeFileSync(join(bin, name), "#!/bin/sh\n");
+    chmodSync(join(bin, name), 0o755);
+  }
+  mkdirSync(join(home, ".config/herdr-core"), { recursive: true });
+  const text = config === undefined ? `restore_screen = true\nshell = ["${bin}/herdr-shell"]\n` : config;
+  if (text !== null) writeFileSync(join(home, ".config/herdr-core/config.toml"), text);
+  return bin;
+}
+
+function reset() {
+  appSettings = {};
+  windows = { one: { space: "space-1", tab: "tab-1", pane: "pane-1", terminal: "t1", shown: null, agent: null, cwd: "/" } };
+  window = "one";
+  paneList = [
+    { pane: "pane-1", terminal: "t1", tab: "tab-1", focused: true },
+    { pane: "pane-7", terminal: "t7", tab: "tab-7", focused: false },
+    { pane: "pane-8", terminal: "t8", tab: "tab-8", focused: false },
+  ];
+  core = { t1: [shellCore], t7: [piCore()], t8: [claudeCore()] };
+  terminalList = [listed(shellCore), listed(piCore()), listed(claudeCore())];
+  store = new Map();
+  failing = new Set();
+  processRows = [[1, 0, "/sbin/launchd"], [90, 1, "hc server"], [100, 90, "pi"], [101, 100, "npm exec shadcn@latest mcp"],
+    [200, 90, "fish"], [201, 200, "claude"], [50, 90, "fish"]];
+  calls = [];
+  shEnv = {};
+  makeHome();
+}
+
+// What the policy did to terminals and processes, without the process table reads.
+const actions = () => calls.filter(([command]) => command !== "ps");
+const labelOf = (call) => JSON.parse(call.at(-1).slice(`${SUSPENDED}=`.length));
+
+test.after(() => { if (home) rmSync(home, { recursive: true, force: true }); });
+
+test("a suspension checks, keeps, checks again, labels and signals, in that order", async () => {
+  reset();
+  const s = createSuspender({ id: "a" });
+  assert.deepEqual(await s.suspend("t7", { now: NOW }), { suspended: true });
+  assert.deepEqual(actions().map((c) => c.slice(0, 3)), [
+    ["hc", "get", "t7"], ["hc", "keep", "t7"], ["hc", "get", "t7"], ["hc", "label", "t7"], ["kill", "-TERM", "100"],
+  ]);
+  const label = actions()[3];
+  assert.equal(label.length, 4);
+  assert.deepEqual(labelOf(label), { version: 1, agent: "pi", root: "agent", cwd: "/project", since: NOW });
+});
+
+test("an agent inside a shell is recorded with root shell, and the shell gets SIGTERM (fact F3)", async () => {
+  reset();
+  const s = createSuspender({ id: "a" });
+  assert.deepEqual(await s.suspend("t8", { now: NOW }), { suspended: true });
+  const done = actions();
+  assert.deepEqual(labelOf(done[3]), { version: 1, agent: "claude", root: "shell", cwd: "/work/app", since: NOW });
+  // The terminal's main program (fish, 200), never the agent in front (201).
+  assert.deepEqual(done[4], ["kill", "-TERM", "200"]);
+});
+
+test("step 1 aborts when the agent is no longer unused, before anything changes", async () => {
+  for (const [answer, reason] of [
+    [piCore({ status: { app: "pi", state: "working" } }), "working"],
+    [piCore({ status_ms: NOW - MINUTE }), "recent"],
+    [piCore({ labels: { [LABEL]: "pi", [PI_RECOVERY]: piRecord, "herdr.never-suspend": "1" } }), "pinned"],
+    [piCore({ state: "finished" }), "gone"],
+    [null, "gone"],
+    // Without a folder to wake in, the agent cannot be started again.
+    [piCore({ foreground: { pid: 100, argv: ["pi"], cwd: null } }), "not-resumable"],
+  ]) {
+    reset();
+    core.t7 = answer ? [answer] : [];
+    const s = createSuspender({ id: "a" });
+    assert.deepEqual(await s.suspend("t7", { now: NOW }), { suspended: false, reason }, reason);
+    assert.deepEqual(actions(), [["hc", "get", "t7", "--json"]], reason);
+  }
+});
+
+test("step 2 aborts when the terminal cannot be kept", async () => {
+  reset();
+  failing.add("keep");
+  assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: false, reason: "failed" });
+  assert.deepEqual(actions().map((c) => c[1]), ["get", "keep"]);
+});
+
+test("step 3 aborts when the status or the turn changed after the keep", async () => {
+  for (const [second, reason] of [
+    [piCore({ status: { app: "pi", state: "working" } }), "status"],
+    // A whole turn went by: the status is idle again, but the turn moved on.
+    [piCore({ turn: 5 }), "turn"],
+    [piCore({ pid: 300, foreground: { pid: 300, argv: ["pi"], cwd: "/project" } }), "program"],
+    [piCore({ state: "finished" }), "finished"],
+  ]) {
+    reset();
+    core.t7 = [piCore(), second];
+    const result = await createSuspender({ id: "a" }).suspend("t7", { now: NOW });
+    assert.deepEqual(result, { suspended: false, reason: reason === "finished" ? "gone" : "changed" }, reason);
+    assert.deepEqual(actions().map((c) => c[1]), ["get", "keep", "get"], reason);
+  }
+});
+
+test("step 4 aborts when the label cannot be set: no signal", async () => {
+  reset();
+  failing.add("label");
+  assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: false, reason: "failed" });
+  assert.deepEqual(actions().map((c) => c[1]), ["get", "keep", "get", "label"]);
+});
+
+test("step 5 reports a signal that could not be sent", async () => {
+  reset();
+  failing.add("kill");
+  assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: false, reason: "failed" });
+  assert.deepEqual(actions().map((c) => c[0] === "kill" ? "kill" : c[1]), ["get", "keep", "get", "label", "kill"]);
+});
+
+test("a closed copy stops between steps", async () => {
+  reset();
+  const s = createSuspender({ id: "a" });
+  // The mod closes while step 1 reads the terminal.
+  core.t7 = [() => { s.close(); return piCore(); }];
+  assert.deepEqual(await s.suspend("t7", { now: NOW }), { suspended: false, reason: "closed" });
+  assert.deepEqual(actions().map((c) => c[1]), ["get"]);
+});
+
+test("nothing is suspended while the stand-in or the launcher is missing, or the launcher is not hc's shell", async () => {
+  const cases = {
+    "no stand-in": () => makeHome({ standin: false }),
+    "no launcher": () => makeHome({ shell: false }),
+    "no core config": () => makeHome({ config: null }),
+    "no shell key": () => makeHome({ config: "restore_screen = true\n" }),
+    "another shell": () => makeHome({ config: 'shell = ["/opt/homebrew/bin/fish"]\n' }),
+    "a shell key in a table": () => { const bin = makeHome(); writeFileSync(join(home, ".config/herdr-core/config.toml"), `[other]\nshell = ["${bin}/herdr-shell"]\n`); },
+    // hc reads shell as a word list (shell = ["nu"]).
+    "a plain string": () => { const bin = makeHome(); writeFileSync(join(home, ".config/herdr-core/config.toml"), `shell = "${bin}/herdr-shell"\n`); },
+    "the launcher as an argument": () => { const bin = makeHome(); writeFileSync(join(home, ".config/herdr-core/config.toml"), `shell = ["/bin/sh", "${bin}/herdr-shell"]\n`); },
+    "a commented-out key": () => { const bin = makeHome(); writeFileSync(join(home, ".config/herdr-core/config.toml"), `# shell = ["${bin}/herdr-shell"]\n`); },
+  };
+  for (const [name, setup] of Object.entries(cases)) {
+    reset();
+    setup();
+    const s = createSuspender({ id: "a" });
+    assert.deepEqual(await s.suspend("t7", { now: NOW }), { suspended: false, reason: "not-installed" }, name);
+    assert.deepEqual(await s.suspend("t7", { now: NOW, manual: true }), { suspended: false, reason: "not-installed" }, name);
+    assert.deepEqual(actions(), [], name);
+  }
+});
+
+test("the launcher counts as hc's shell in the forms a TOML file can write it", async () => {
+  for (const config of [
+    (bin) => `shell = ["${bin}/herdr-shell"]\n`,
+    (bin) => `# core settings\nrestore_screen = true\n  shell=[ '${bin}/herdr-shell' ]  # suspension\n\n[machine.mini]\nshell = ["fish"]\n`,
+    (bin) => `"shell" = [\n  "${bin}/herdr-shell", # the launcher\n]\n`,
+  ]) {
+    reset();
+    const bin = join(home, ".local/share/herdr-tincho-config/bin");
+    writeFileSync(join(home, ".config/herdr-core/config.toml"), config(bin));
+    assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: true }, config(bin));
+  }
+});
+
+test("the XDG data and config folders are honored", async () => {
+  reset();
+  const data = join(home, "data");
+  const config = join(home, "config");
+  const bin = join(data, "herdr-tincho-config/bin");
+  mkdirSync(bin, { recursive: true });
+  for (const name of ["herdr-standin", "herdr-shell"]) { writeFileSync(join(bin, name), "#!/bin/sh\n"); chmodSync(join(bin, name), 0o755); }
+  mkdirSync(join(config, "herdr-core"), { recursive: true });
+  writeFileSync(join(config, "herdr-core/config.toml"), `shell = ["${bin}/herdr-shell"]\n`);
+  // The default folders hold another shell: only the XDG folders count.
+  writeFileSync(join(home, ".config/herdr-core/config.toml"), 'shell = ["fish"]\n');
+  shEnv = { XDG_DATA_HOME: data, XDG_CONFIG_HOME: config };
+  assert.deepEqual(await createSuspender({ id: "a" }).suspend("t7", { now: NOW }), { suspended: true });
+});
+
+// The mod's side of the policy: render calls observe(), and when it asks,
+// cx.spawn runs act() with cx.timer.after as the timer. Each copy renders in
+// its own window (focused() answers for that window). Timers are fakes that
+// elapse() fires.
+let clockNow = NOW;
+let timers = [];
+const schedule = (ms, run) => {
+  const timer = { ms, run, at: clockNow, cancelled: false, fired: false, cancel() { timer.cancelled = true; } };
+  timers.push(timer);
+  return timer;
+};
+const copy = (id) => createSuspender({ id, clock: () => clockNow });
+async function render(s, name, now) {
+  window = name;
+  clockNow = now;
+  if (s.observe(now)) await s.act({ now, schedule });
+}
+async function elapse(name, now) {
+  window = name;
+  clockNow = now;
+  for (const timer of timers) {
+    if (timer.cancelled || timer.fired || timer.at + timer.ms > now) continue;
+    timer.fired = true;
+    await timer.run();
+  }
+}
+const inWindow = async (name, call) => { window = name; return call(); };
+const suspendedAddresses = () => actions().filter(([command]) => command === "hc").filter(([, c]) => c === "label").map(([, , address]) => address);
+const focusT7 = { space: "space-1", tab: "tab-7", pane: "pane-7", terminal: "t7", shown: null, agent: null, cwd: "/project" };
+const resetCopies = () => { reset(); timers = []; clockNow = NOW; windows.two = { ...windows.one }; };
+
+test("with two copies, only one leads and acts", async () => {
+  resetCopies();
+  const a = copy("a");
+  const b = copy("b");
+  await render(a, "one", NOW);
+  await render(b, "two", NOW);
+  assert.equal(a.leading(NOW), true);
+  assert.equal(b.leading(NOW), false);
+  await inWindow("two", () => b.pass(NOW));
+  assert.deepEqual(actions(), []);
+  await inWindow("one", () => a.pass(NOW));
+  assert.deepEqual(suspendedAddresses(), ["t7", "t8"]);
+  assert.deepEqual(actions().filter(([c]) => c === "kill"), [["kill", "-TERM", "100"], ["kill", "-TERM", "200"]]);
+});
+
+test("a copy leads only once its own entry is published, and a stale or closed leader hands over", async () => {
+  resetCopies();
+  const a = copy("a");
+  const b = copy("b");
+  assert.equal(a.leading(NOW), false);
+  await render(b, "two", NOW);
+  assert.equal(a.leading(NOW), false);
+  assert.equal(b.leading(NOW), true);
+  await render(a, "one", NOW);
+  assert.equal(b.leading(NOW), false);
+  // a's heartbeat stops (its window closed without closing the copy): after a
+  // while, b leads again. b's heartbeat comes from its pass.
+  const later = NOW + 200_000;
+  await inWindow("two", () => b.pass(later));
+  assert.equal(b.leading(later), true);
+  assert.equal(a.leading(later), false);
+  // a keeps its heartbeat, then closes.
+  await inWindow("one", () => a.pass(later));
+  assert.equal(b.leading(later), false);
+  a.close();
+  assert.equal(b.leading(later), true);
+});
+
+test("a terminal focused in another window is never suspended", async () => {
+  resetCopies();
+  windows.two = { ...windows.one, tab: "tab-7", pane: "pane-7", terminal: "t7" };
+  const a = copy("a");
+  const b = copy("b");
+  await render(a, "one", NOW);
+  await render(b, "two", NOW);
+  await inWindow("one", () => a.pass(NOW));
+  assert.deepEqual(suspendedAddresses(), ["t8"]);
+  assert.deepEqual(await inWindow("one", () => a.suspend("t7", { now: NOW, manual: true })), { suspended: false, reason: "focused" });
+});
+
+test("the focus of a window whose copy stopped is ignored", async () => {
+  resetCopies();
+  windows.two = { ...windows.one, tab: "tab-7", pane: "pane-7", terminal: "t7" };
+  const a = copy("a");
+  const b = copy("b");
+  await render(b, "two", NOW - 200_000);
+  await render(a, "one", NOW);
+  await inWindow("one", () => a.pass(NOW));
+  assert.deepEqual(suspendedAddresses(), ["t7", "t8"]);
+});
+
+test("the idle clock counts from when the tab was last focused, in this window or another", async () => {
+  for (const where of ["one", "two"]) {
+    resetCopies();
+    terminalList = terminalList.filter((t) => t.address !== "t8");
+    const a = copy("a");
+    const b = copy("b");
+    const other = where === "one" ? a : b;
+    let suspendedAt = null;
+    // A pass in each copy every minute (their heartbeats keep both entries
+    // fresh). From 39 to 10 minutes ago someone looked at t7 (idle for an
+    // hour), with no render in between.
+    for (let at = NOW - 40 * MINUTE; at <= NOW + 25 * MINUTE && suspendedAt === null; at += MINUTE) {
+      if (at === NOW - 39 * MINUTE) windows[where] = focusT7;
+      if (at === NOW - 10 * MINUTE) windows[where] = { ...focusT7, tab: "tab-1", pane: "pane-1", terminal: "t1" };
+      await render(other, where, at);
+      await inWindow("two", () => b.pass(at));
+      await inWindow("one", () => a.pass(at));
+      if (suspendedAddresses().length) suspendedAt = at;
+    }
+    // 30 minutes after the look ended.
+    assert.equal(suspendedAt, NOW + 20 * MINUTE, where);
+    assert.deepEqual(suspendedAddresses(), ["t7"], where);
+  }
+});
+
+test("observe() changes nothing outside its copy and runs no command", async () => {
+  resetCopies();
+  const a = copy("a");
+  const before = JSON.stringify([...store]);
+  window = "one";
+  assert.equal(a.observe(NOW), true);
+  // Asked once until act() runs.
+  assert.equal(a.observe(NOW + 10), false);
+  windows.one = { ...windows.one, tab: "tab-7", pane: "pane-7", terminal: "t7" };
+  assert.equal(a.observe(NOW + 20), false);
+  assert.equal(JSON.stringify([...store]), before);
+  assert.deepEqual(calls, []);
+  await a.act({ now: NOW + 30, schedule });
+  assert.deepEqual(Object.keys(store.get(policy.SUSPEND_WINDOWS)), ["a"]);
+  // Nothing new: no more work.
+  assert.equal(a.observe(NOW + 40), false);
+});
+
+// t7 after its suspension: herdr-shell started the stand-in, which reports idle.
+const standinRecord = JSON.stringify({ version: 1, agent: "pi", root: "agent", cwd: "/project", since: NOW - 5 * MINUTE });
+function suspendT7(report = { app: "herdr-standin", state: "idle" }) {
+  const j = piCore({ pid: 400, argv: ["/bin/sh", "herdr-shell"], foreground: { pid: 400, argv: ["herdr-standin", "pi", "t7", ""], cwd: "/project" },
+    status: report, labels: { ...piCore().labels, [SUSPENDED]: standinRecord }, keep: true });
+  core.t7 = [j];
+  terminalList = terminalList.map((t) => t.address === "t7" ? { ...listed(j), program: { key: "herdr-standin", agent: false, shell: false } } : t);
+}
+const presses = () => actions().filter(([, command]) => command === "keys");
+const live = () => timers.filter((t) => !t.cancelled && !t.fired);
+
+test("a suspended agent whose tab stays focused for 1 s gets one empty Enter in its stand-in, from one timer", async () => {
+  resetCopies();
+  suspendT7();
+  const a = copy("a");
+  await render(a, "one", NOW);
+  assert.deepEqual(timers, []);
+  windows.one = focusT7;
+  await render(a, "one", NOW + 250);
+  assert.deepEqual(timers.map((t) => t.ms), [1000]);
+  await render(a, "one", NOW + 500);
+  await elapse("one", NOW + 1249);
+  assert.deepEqual(presses(), []);
+  await elapse("one", NOW + 1250);
+  assert.deepEqual(presses(), [["hc", "keys", "t7", "enter"]]);
+  // Still focused: no second timer, no second Enter.
+  await render(a, "one", NOW + 1500);
+  await elapse("one", NOW + 5000);
+  assert.equal(timers.length, 1);
+  assert.deepEqual(presses(), [["hc", "keys", "t7", "enter"]]);
+});
+
+test("stepping past a suspended agent's tab wakes nothing: its timer is cancelled", async () => {
+  resetCopies();
+  suspendT7();
+  const a = copy("a");
+  await render(a, "one", NOW);
+  // ⌘P or the next-agent command moves through t7 and on.
+  windows.one = focusT7;
+  await render(a, "one", NOW + 250);
+  windows.one = { ...focusT7, tab: "tab-8", pane: "pane-8", terminal: "t8" };
+  await render(a, "one", NOW + 1000);
+  assert.deepEqual(timers.map((t) => t.cancelled), [true]);
+  await elapse("one", NOW + 3000);
+  assert.deepEqual(presses(), []);
+});
+
+test("a wake timer that fires after the focus moved, before any render, wakes nothing", async () => {
+  resetCopies();
+  suspendT7();
+  const a = copy("a");
+  await render(a, "one", NOW);
+  windows.one = focusT7;
+  await render(a, "one", NOW + 250);
+  windows.one = { ...focusT7, tab: "tab-1", pane: "pane-1", terminal: "t1" };
+  await elapse("one", NOW + 1250);
+  assert.deepEqual(presses(), []);
+});
+
+test("focus in another window wakes too, but only the leader arms a timer and presses Enter", async () => {
+  resetCopies();
+  suspendT7();
+  const a = copy("a");
+  const b = copy("b");
+  await render(a, "one", NOW);
+  windows.two = focusT7;
+  await render(b, "two", NOW);
+  assert.deepEqual(timers, []);
+  // b's entry re-renders every mod: the leader sees the focus.
+  await render(a, "one", NOW + 10);
+  assert.deepEqual(timers.map((t) => t.ms), [990]);
+  await elapse("one", NOW + 1000);
+  assert.deepEqual(presses(), [["hc", "keys", "t7", "enter"]]);
+});
+
+test("no Enter goes to a terminal that is not an idle stand-in, until its stand-in waits", async () => {
+  for (const [name, setup] of [
+    // The label is set, but the agent has not ended yet (between steps 4 and 5).
+    ["agent still running", () => { core.t7 = [piCore({ labels: { ...piCore().labels, [SUSPENDED]: standinRecord } })]; terminalList = terminalList.map((t) => t.address === "t7" ? listed(core.t7[0]) : t); }],
+    ["waking", () => suspendT7({ app: "herdr-standin", state: "working" })],
+    ["session missing", () => suspendT7({ app: "herdr-standin", state: "blocked" })],
+    ["not suspended", () => {}],
+  ]) {
+    resetCopies();
+    setup();
+    const a = copy("a");
+    windows.one = focusT7;
+    await render(a, "one", NOW);
+    await elapse("one", NOW + 2000);
+    assert.deepEqual([timers, presses()], [[], []], name);
+  }
+  // The stand-in starts while the tab is focused: its idle report re-renders,
+  // and the Enter follows 1 s after the focus began.
+  resetCopies();
+  const a = copy("a");
+  windows.one = focusT7;
+  await render(a, "one", NOW);
+  suspendT7();
+  await render(a, "one", NOW + 3000);
+  assert.deepEqual(timers.map((t) => t.ms), [0]);
+  await elapse("one", NOW + 3000);
+  assert.deepEqual(presses(), [["hc", "keys", "t7", "enter"]]);
+});
+
+test("closing a copy cancels its wake timers", async () => {
+  resetCopies();
+  suspendT7();
+  const a = copy("a");
+  windows.one = focusT7;
+  await render(a, "one", NOW);
+  a.close();
+  assert.deepEqual(timers.map((t) => t.cancelled), [true]);
+});
+
+// Another mod (ticket 09's menu) asks for a manual suspension.
+const request = (address, at) => store.set(SUSPEND_REQUESTS, { ...(store.get(SUSPEND_REQUESTS) ?? {}), [address]: at });
+const state = () => store.get(SUSPEND_STATE);
+
+test("a manual request skips the threshold, and its result is shared with the requester", async () => {
+  resetCopies();
+  // Idle for one minute only: too recent for automatic suspension.
+  core.t7 = [piCore({ status_ms: NOW - MINUTE })];
+  terminalList = terminalList.map((t) => t.address === "t7" ? listed(core.t7[0]) : t);
+  const a = copy("a");
+  await render(a, "one", NOW);
+  await a.pass(NOW);
+  assert.deepEqual(suspendedAddresses(), ["t8"]);
+  calls = [];
+  // The request's setShared re-renders every mod.
+  request("t7", NOW + 100);
+  await render(a, "one", NOW + 250);
+  assert.deepEqual(suspendedAddresses(), ["t7"]);
+  assert.deepEqual(state().results.t7, { requested: NOW + 100, suspended: true, reason: null, at: NOW + 250 });
+  // Handled once.
+  calls = [];
+  await render(a, "one", NOW + 500);
+  await render(a, "one", NOW + 750);
+  assert.deepEqual(actions(), []);
+});
+
+test("a manual request still applies every other rule, and the requester gets the reason", async () => {
+  for (const [answer, reason] of [
+    [piCore({ status: { app: "pi", state: "working" } }), "working"],
+    [piCore({ status: { app: "pi", state: "blocked" } }), "blocked"],
+    [piCore({ labels: { [LABEL]: "pi" } }), "not-resumable"],
+    [piCore({ labels: { ...piCore().labels, "herdr.never-suspend": "1" } }), "pinned"],
+  ]) {
+    resetCopies();
+    core.t7 = [answer];
+    const a = copy("a");
+    request("t7", NOW);
+    await render(a, "one", NOW + 250);
+    assert.deepEqual(state().results.t7, { requested: NOW, suspended: false, reason, at: NOW + 250 }, reason);
+    assert.deepEqual(actions(), [["hc", "get", "t7", "--json"]], reason);
+  }
+  resetCopies();
+  makeHome({ standin: false });
+  const a = copy("a");
+  request("t7", NOW);
+  await render(a, "one", NOW + 250);
+  assert.deepEqual(state().results.t7, { requested: NOW, suspended: false, reason: "not-installed", at: NOW + 250 });
+  assert.deepEqual(actions(), []);
+});
+
+test("a request for a focused agent is refused", async () => {
+  resetCopies();
+  windows.one = focusT7;
+  const a = copy("a");
+  request("t7", NOW);
+  await render(a, "one", NOW + 250);
+  assert.equal(state().results.t7.reason, "focused");
+});
+
+test("only the leader handles requests, and an old request is ignored", async () => {
+  resetCopies();
+  const a = copy("a");
+  const b = copy("b");
+  await render(a, "one", NOW);
+  request("t7", NOW);
+  await render(b, "two", NOW + 250);
+  assert.deepEqual(actions(), []);
+  assert.equal(state(), undefined);
+  resetCopies();
+  const c = copy("c");
+  request("t7", NOW - 2 * MINUTE);
+  await render(c, "one", NOW);
+  assert.deepEqual(actions(), []);
+});
+
+test("while automatic suspension is off, nothing is suspended automatically, but manual requests still work", async () => {
+  for (const value of [false, { after_minutes: 0 }]) {
+    resetCopies();
+    appSettings = { "tincho.suspend": value };
+    const a = copy("a");
+    await render(a, "one", NOW);
+    await a.pass(NOW);
+    await a.pass(NOW + 60 * MINUTE);
+    assert.deepEqual(suspendedAddresses(), [], JSON.stringify(value));
+    request("t7", NOW + 60 * MINUTE);
+    await render(a, "one", NOW + 60 * MINUTE + 250);
+    assert.deepEqual(suspendedAddresses(), ["t7"], JSON.stringify(value));
+    assert.equal(state().results.t7.suspended, true);
+  }
+});
+
+test("the leader shares each local agent's current reason, automatic and manual", async () => {
+  resetCopies();
+  appSettings = { "tincho.suspend": { after_minutes: 120 } };
+  windows.one = { ...focusT7, tab: "tab-8", pane: "pane-8", terminal: "t8" };
+  const remote = { ...listed(piCore()), address: "mini/t3" };
+  terminalList.push(remote, { ...listed(piCore({ status: { app: "pi", state: "working" } })), address: "t9" });
+  const a = copy("a");
+  await render(a, "one", NOW);
+  await a.pass(NOW);
+  assert.deepEqual(state().agents, {
+    t7: { auto: "recent", manual: null },
+    t8: { auto: "focused", manual: "focused" },
+    t9: { auto: "working", manual: "working" },
+  });
+  appSettings = { "tincho.suspend": false };
+  await a.pass(NOW + 15_000);
+  assert.deepEqual(state().agents.t7, { auto: "off", manual: null });
+  // The installation is checked again every 10 minutes while no agent qualifies.
+  makeHome({ shell: false });
+  await a.pass(NOW + 30_000);
+  assert.deepEqual(state().agents.t7, { auto: "off", manual: null });
+  await a.pass(NOW + 11 * MINUTE);
+  assert.deepEqual(state().agents.t7, { auto: "off", manual: "not-installed" });
+  appSettings = {};
+  makeHome();
+  makeHome({ standin: false });
+  await a.pass(NOW + 11 * MINUTE + 15_000);
+  assert.deepEqual(state().agents.t7, { auto: "not-installed", manual: "not-installed" });
+  assert.deepEqual(suspendedAddresses(), []);
+});
+
+test("a pass starts no process while no agent is past its threshold", async () => {
+  resetCopies();
+  appSettings = { "tincho.suspend": { after_minutes: 120 } };
+  const a = copy("a");
+  await render(a, "one", NOW);
+  await a.pass(NOW);
+  const runs = shRuns;
+  for (let i = 1; i <= 20; i++) await a.pass(NOW + i * 15_000);
+  assert.deepEqual(calls, []);
+  assert.equal(shRuns, runs);
+});
+
+test("an agent kept by its background processes gets its process table read again only after five minutes", async () => {
+  resetCopies();
+  processRows.push([102, 100, "npm run dev"]);
+  const a = copy("a");
+  await render(a, "one", NOW);
+  await a.pass(NOW);
+  const reads = () => calls.filter(([command]) => command === "ps").length;
+  // t7 kept by its dev server; t8 (no child process) suspended.
+  assert.deepEqual(suspendedAddresses(), ["t8"]);
+  assert.equal(reads(), 2);
+  core.t8 = [claudeCore({ labels: { ...claudeCore().labels, [SUSPENDED]: "{}" } })];
+  terminalList = terminalList.map((t) => t.address === "t8" ? listed(core.t8[0]) : t);
+  await a.pass(NOW + 15_000);
+  await a.pass(NOW + 4 * MINUTE);
+  assert.equal(reads(), 2);
+  assert.deepEqual(state().agents.t7, { auto: "background", manual: "background" });
+  await a.pass(NOW + 5 * MINUTE);
+  assert.equal(reads(), 3);
+});

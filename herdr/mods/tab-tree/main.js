@@ -4,6 +4,8 @@
 // an agent (with its status), an idle shell, or a program (nvim, lazygit, ...).
 // Hover a tab back at a shell prompt for ↻: it resumes the agent the terminal
 // last ran (resume.js). No record of one, no button.
+// It also runs the suspension policy (suspend-policy.js): unused agents are
+// suspended, and a suspended agent wakes when its tab stays focused for 1 s.
 // Drag a group's header above or below another group to reorder the spaces.
 // Drag a tab between two rows to reorder it, or into another space to move it
 // there, programs still running. A ghost of the row follows the pointer and a
@@ -14,8 +16,9 @@
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, panes, terminals, machines, run, openOverlay, theme, shared, setShared, exec, hc, home, layout } from "herdr";
-import { LABEL, SESSION, RECIPES, createRecovery, remember, claudeLaunch, rememberClaudeLaunch } from "./resume.js";
+import { LABEL, RECIPES, createRecovery, remember, claudeLaunch, rememberClaudeLaunch } from "./resume.js";
 import { claudeCandidate, processIdentity } from "./claude-polling.js";
+import { createSuspender } from "./suspend-policy.js";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -93,11 +96,45 @@ export default class TabTree extends View {
     cx.timer.every(3000, (cx) => this.remember(cx));
     this.sessionsBusy = false;
     cx.timer.every(10000, (cx) => this.rememberSessions(cx));
+    // One policy per copy; only the leading copy acts (several windows can
+    // show tab-tree at once). Focus and manual requests are observed in
+    // render; the 15 s pass is the only periodic work.
+    this.suspender = createSuspender();
+    this.suspendPassing = false;
+    cx.timer.every(15000, (cx) => this.suspendPass(cx));
     this.refresh(cx);
   }
 
   close() {
     this.recovery.close();
+    this.suspender.close();
+  }
+
+  // The policy's heartbeat, shared reasons and automatic suspension, never
+  // two at once.
+  suspendPass(cx) {
+    if (this.suspendPassing) return;
+    this.suspendPassing = true;
+    try {
+      cx.spawn(async () => {
+        try {
+          await this.suspender.pass();
+        } finally {
+          this.suspendPassing = false;
+        }
+      });
+    } catch (error) {
+      this.suspendPassing = false;
+      throw error;
+    }
+  }
+
+  // From render: the policy records the focus and the manual requests; what
+  // it must do about them (publish, wake timers, requests) starts outside
+  // render, in a task, with that task's timers.
+  observeSuspension(cx) {
+    if (!this.suspender.observe()) return;
+    cx.spawn((cx) => this.suspender.act({ schedule: (ms, run) => cx.timer.after(ms, (cx) => cx.spawn(run)) }));
   }
 
   // A terminal's tag (its `tag` label) as a small chip, or nothing.
@@ -655,6 +692,7 @@ export default class TabTree extends View {
 
   render(cx) {
     this.watch(cx);
+    this.observeSuspension(cx);
     const t = theme();
     const collapsed = narrow();
     const ps = panes();

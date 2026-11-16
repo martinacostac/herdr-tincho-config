@@ -20,11 +20,17 @@ globalThis[hostKey] = {
     if (command !== "ps") throw new Error(`unexpected exec: ${command}`);
     return processTable();
   },
+  // The suspension steps and leader choice, tested in suspension.test.mjs.
+  terminals: () => { throw new Error("unexpected terminals()"); },
+  shared: () => { throw new Error("unexpected shared()"); },
+  setShared: () => { throw new Error("unexpected setShared()"); },
+  readTextFile: async () => { throw new Error("unexpected readTextFile()"); },
+  hc: async () => { throw new Error("unexpected hc()"); },
 };
 const moduleUrl = (source) => "data:text/javascript," + encodeURIComponent(source);
 const hook = registerHooks({
   resolve(specifier, context, next) {
-    if (specifier === "herdr") return { url: moduleUrl(`export const { settings, focused, panes, exec } = globalThis[Symbol.for("herdr.suspend-policy.test-host")];`), shortCircuit: true };
+    if (specifier === "herdr") return { url: moduleUrl(`export const { settings, focused, panes, terminals, shared, setShared, readTextFile, exec, hc } = globalThis[Symbol.for("herdr.suspend-policy.test-host")];`), shortCircuit: true };
     return next(specifier, context);
   },
 });
@@ -264,13 +270,19 @@ test("a descendant process that is not a helper keeps the agent in use, also in 
   for (const extra of [
     [[103, 100, "npm run dev"]],
     [[103, 100, "npm run dev"], [104, 103, "node node_modules/.bin/vite"]],
-    // A grandchild under an MCP server that is not a helper itself.
-    [[103, 102, "sleep 600"]],
+    // A child whose command line matches does not make its parent a helper.
+    [[103, 100, "npm run dev"], [104, 103, "node mcp-inspector"]],
   ]) {
     processTable = table([...piProcesses, ...extra]);
     assert.deepEqual(await unusedAgent(pi(), { now: NOW }), { unused: false, reason: "background" }, JSON.stringify(extra));
     assert.deepEqual(await unusedAgent(pi(), { now: NOW, manual: true }), { unused: false, reason: "background" }, JSON.stringify(extra));
   }
+});
+
+test("every process under a helper is part of that helper (uvx -> python)", async () => {
+  reset();
+  processTable = table([...piProcesses, [103, 100, "uvx some-mcp-server"], [104, 103, "python -m some_server"], [105, 104, "sleep 600"], [106, 102, "git status"]]);
+  assert.deepEqual(await unusedAgent(pi(), { now: NOW }), { unused: true, agent: "pi" });
 });
 
 test("a custom allow-list marks other command lines as helpers by containment, and replaces the default", async () => {
@@ -322,4 +334,19 @@ test("a descendant without a command line (a zombie) is not a helper", async () 
   const rows = await table(piProcesses)();
   processTable = async () => ({ ...rows, stdout: rows.stdout + "  103   100\n" });
   assert.deepEqual(await unusedAgent(pi(), { now: NOW }), { unused: false, reason: "background" });
+});
+
+test("an agent whose terminal already has the suspension label is not unused, also in the manual mode", async () => {
+  reset();
+  const record = JSON.stringify({ version: 1, agent: "pi", root: "agent", cwd: "/project", since: NOW });
+  const labeled = pi({ labels: { ...pi().labels, "herdr.suspended": record } });
+  assert.deepEqual(await unusedAgent(labeled, { now: NOW }), { unused: false, reason: "suspended" });
+  assert.deepEqual(await unusedAgent(labeled, { now: NOW, manual: true }), { unused: false, reason: "suspended" });
+});
+
+test("a terminal focused in another window counts as focused", async () => {
+  reset();
+  assert.deepEqual(await unusedAgent(pi(), { now: NOW, focusedTerminals: new Set(["t7"]) }), { unused: false, reason: "focused" });
+  assert.deepEqual(await unusedAgent(pi(), { now: NOW, manual: true, focusedTerminals: new Set(["t7"]) }), { unused: false, reason: "focused" });
+  assert.deepEqual(await unusedAgent(pi(), { now: NOW, focusedTerminals: new Set(["t9"]) }), { unused: true, agent: "pi" });
 });

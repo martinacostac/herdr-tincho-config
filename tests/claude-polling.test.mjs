@@ -24,7 +24,7 @@ globalThis[hostKey] = {
 const moduleUrl = (source) => "data:text/javascript," + encodeURIComponent(source);
 const hook = registerHooks({
   resolve(specifier, context, next) {
-    if (specifier === "herdr") return { url: moduleUrl(`export const { terminals, hc, exec } = globalThis[Symbol.for("herdr.claude-polling.test-host")]; export const spaces = null, panes = null, machines = null, run = null, openOverlay = null, theme = null, shared = null, setShared = null, home = null, layout = null;`), shortCircuit: true };
+    if (specifier === "herdr") return { url: moduleUrl(`export const { terminals, hc, exec } = globalThis[Symbol.for("herdr.claude-polling.test-host")]; export const spaces = null, panes = null, machines = null, run = null, openOverlay = null, theme = null, shared = null, setShared = null, home = null, layout = null, focused = null, settings = null, readTextFile = null;`), shortCircuit: true };
     if (specifier === "gpui-kit") return { url: moduleUrl("export class View {} export const div = null, image = null, svg = null;"), shortCircuit: true };
     if (specifier === "gpui-base") return { url: moduleUrl("export const v_flex = null, h_flex = null;"), shortCircuit: true };
     return next(specifier, context);
