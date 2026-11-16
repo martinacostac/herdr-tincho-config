@@ -12,17 +12,22 @@ import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { run, props, closeOverlay, openOverlay, theme, keys, terminals, spaces, panes, exec, hc, shared, setShared, notify } from "herdr";
 
-// The suspension policy's entry point (tab-tree's suspend-policy.js; mods
-// can't import each other, so the names are repeated here).
-// REQUESTS: { [address]: ms }, a manual suspension request per terminal.
+// The suspension policy's entry point (tab-tree's suspend-policy.js:
+// SUSPEND_REQUESTS, SUSPEND_STATE and its Outcome reasons). Mods can't import
+// each other, so the names, record() and suspendState() (its currentState())
+// are repeated here.
+// REQUESTS: { [address]: ms }, a manual suspension request per terminal; the
+// leader ignores a request older than REQUEST_MS.
 // STATE: { agents: { [address]: { auto, manual } }, results: { [address]:
 // { requested, suspended, reason, at } } }, written by the leading copy.
 const SUSPEND_REQUESTS = "tincho.suspend.requests";
 const SUSPEND_STATE = "tincho.suspend.state";
+const REQUEST_MS = 60_000;
 const NEVER_SUSPEND = "herdr.never-suspend";
 const SUSPENDED = "herdr.suspended";
 
-// Menu text for each reason the policy gives (an unknown one shows as is).
+// Menu text for each reason the policy gives (an unknown one shows as is),
+// and "no-answer": no copy of tab-tree handled the request in time.
 const REASONS = {
   off: "automatic suspension off",
   remote: "remote terminal",
@@ -36,14 +41,13 @@ const REASONS = {
   recent: "idle too briefly",
   "processes-unknown": "processes unknown",
   background: "background processes",
-  "not-installed": "not installed",
+  "not-installed": "suspension not installed",
   gone: "terminal ended",
   changed: "agent changed",
   failed: "hc command failed",
   closed: "tab tree closed",
+  "no-answer": "no answer from tab tree",
 };
-// The shared reasons skip the process rule, so these show only in a result.
-const PROCESS_REASONS = new Set(["background", "processes-unknown"]);
 // Reasons the policy checks before the pin.
 const BEFORE_PIN = new Set(["remote", "suspended", "not-resumable"]);
 
@@ -55,28 +59,27 @@ function suspendState() {
   return { agents: record(value.agents), results: record(value.results) };
 }
 
+// Labels live in this machine's core: a remote address carries its machine (mini/t7).
+const isLocal = (address) => Boolean(address) && !address.includes("/");
+const terminalAt = (address) => terminals().find((t) => t.address === address);
+const pinned = (term) => term.labels?.[NEVER_SUSPEND] === "1";
+
 // The local agent a tab shows (also a suspended one), or nothing.
 function tabAgent(address) {
-  if (!address || address.includes("/")) return null;
-  const term = terminals().find((t) => t.address === address);
+  const term = isLocal(address) && terminalAt(address);
   if (!term) return null;
   return term.program?.agent || term.report || Object.hasOwn(term.labels ?? {}, SUSPENDED) ? term : null;
 }
 
 // Why "Suspend now" would fail now, or null: the labels first (they change at
-// once), then the leader's last pass (every 15 s), then the process rule from
-// the last request's result.
+// once), then the leader's last pass (every 15 s). That pass skips the process
+// rule, so "background" shows only in a request's result.
 function suspendReason(term) {
-  const labels = term.labels ?? {};
-  if (Object.hasOwn(labels, SUSPENDED)) return "suspended";
-  const pinned = labels[NEVER_SUSPEND] === "1";
-  const { agents, results } = suspendState();
-  let reason = agents[term.address]?.manual ?? null;
-  if (reason === "pinned" && !pinned) reason = null; // unpinned since that pass
-  if (pinned && !BEFORE_PIN.has(reason)) return "pinned";
-  if (reason !== null) return reason;
-  const last = results[term.address];
-  return last?.suspended === false && PROCESS_REASONS.has(last.reason) ? last.reason : null;
+  if (Object.hasOwn(term.labels ?? {}, SUSPENDED)) return "suspended";
+  let reason = suspendState().agents[term.address]?.manual ?? null;
+  if (reason === "pinned" && !pinned(term)) reason = null; // unpinned since that pass
+  if (pinned(term) && !BEFORE_PIN.has(reason)) return "pinned";
+  return reason;
 }
 
 // Sets or clears the pin (hc label <t> key= removes the label). The menu is
@@ -87,33 +90,38 @@ async function setPin(address, pin) {
   notify({ title: pin ? "Never suspend failed" : "Removing Never suspend failed", body: String(r?.stderr ?? "").trim() || address, level: "error" });
 }
 
-const cannot = (reason) => `Can't suspend: ${REASONS[reason] ?? String(reason)}`;
+const refusal = (reason) => `Can't suspend: ${REASONS[reason] ?? String(reason)}`;
 
-// The suspension items for an agent tab. request: this menu's own request
-// ({ address, at }), whose result replaces the item's text.
+// The outcome of this menu's request ({ address, at }), or null while it waits.
+// A newer request for the same terminal (from another menu) answers it too:
+// the leader handles only the latest one. No timer: the check runs on render.
+function requestOutcome(request) {
+  const result = suspendState().results[request.address];
+  if (result?.requested >= request.at) return result.suspended ? "Suspended" : refusal(result.reason);
+  return Date.now() - request.at >= REQUEST_MS ? refusal("no-answer") : null;
+}
+
+// The suspension items for an agent tab. request: this menu's own request,
+// whose outcome replaces the item's text ("Suspending…" while it waits).
 function suspendItems(address, request) {
   const term = tabAgent(address);
   if (!term) return [];
   let label;
-  if (request?.address === term.address) {
-    const result = suspendState().results[term.address];
-    if (result?.requested !== request.at) label = "Suspending…";
-    else label = result.suspended ? "Suspended" : cannot(result.reason);
-  } else {
+  if (request?.address === term.address) label = requestOutcome(request) ?? "Suspending…";
+  else {
     const reason = suspendReason(term);
-    label = reason === null ? "Suspend now" : cannot(reason);
+    label = reason === null ? "Suspend now" : refusal(reason);
   }
-  const pinned = term.labels?.[NEVER_SUSPEND] === "1";
   return [
     [label, "suspend", { terminal: term.address }],
-    [pinned ? "Remove Never suspend" : "Never suspend", "pin", { terminal: term.address, pin: !pinned }],
+    [pinned(term) ? "Remove Never suspend" : "Never suspend", "pin", { terminal: term.address, pin: !pinned(term) }],
   ];
 }
 
-// The tag item for a local terminal, or nothing (labels live in this machine's core).
+// The tag item for a local terminal, or nothing.
 function tagItem(address) {
-  if (!address || address.includes("/")) return [];
-  const term = terminals().find((t) => t.address === address);
+  if (!isLocal(address)) return [];
+  const term = terminalAt(address);
   const value = term?.labels?.tag ?? "";
   return [[value ? `Change tag (${value})…` : "Set tag…", "tag", { terminal: address, value, name: term?.name || term?.title || address }]];
 }
@@ -222,6 +230,8 @@ export default class Menu extends View {
     // The menu stays open to show the result; setShared re-renders it.
     if (it[1] === "suspend") {
       const address = it[2].terminal;
+      // A pending request is not sent again (that would hide its result).
+      if (this.request?.address === address && requestOutcome(this.request) === null) return;
       this.request = { address, at: Date.now() };
       // Merge: other terminals' requests stay.
       setShared(SUSPEND_REQUESTS, { ...record(shared(SUSPEND_REQUESTS)), [address]: this.request.at });

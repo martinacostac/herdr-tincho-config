@@ -81,11 +81,21 @@ function open() {
   return view;
 }
 
+// Clicks the rendered row (id mi-<i>) that shows the label.
 /** @param {Menu} view @param {string} label */
 function choose(view, label) {
-  const i = labels(view).indexOf(label);
-  assert.ok(i >= 0, `no item ${label} in ${labels(view).join(", ")}`);
-  view.choose(i, cx);
+  const tree = view.render(cx);
+  const rows = [];
+  const walk = (node) => {
+    if (!node || typeof node !== "object") return;
+    if (/^mi-\d+$/.test(node.attrs?.id?.[0])) rows.push(node);
+    for (const child of node.nodes ?? []) walk(child);
+  };
+  walk(tree);
+  const has = (node) => typeof node === "string" ? node === label : (node?.nodes ?? []).some(has);
+  const row = rows.find(has);
+  assert.ok(row, `no item ${label} in ${labels(view).join(", ")}`);
+  row.attrs.on_click[0]({}, cx);
 }
 
 const leaderSays = (agents = {}, results = {}) => state.shared.set(STATE, { agents, results });
@@ -154,7 +164,7 @@ const TEXTS = {
   recent: "idle too briefly",
   "processes-unknown": "processes unknown",
   background: "background processes",
-  "not-installed": "not installed",
+  "not-installed": "suspension not installed",
   gone: "terminal ended",
   changed: "agent changed",
   failed: "hc command failed",
@@ -181,12 +191,33 @@ test("an unknown reason still shows, as its own word", () => {
   assert.ok(labels(open()).includes("Can't suspend: solar-flare"));
 });
 
-test("a recent process-rule result shows before a new request, other old results do not", () => {
+test("a request's result does not outlive the menu: a new menu shows the leader's shared reason", () => {
   reset();
   leaderSays({ t7: { auto: "recent", manual: null } }, { t7: { requested: 1, suspended: false, reason: "background", at: Date.now() } });
-  assert.ok(labels(open()).includes("Can't suspend: background processes"));
-  leaderSays({ t7: { auto: "recent", manual: null } }, { t7: { requested: 1, suspended: false, reason: "focused", at: Date.now() } });
-  assert.ok(labels(open()).includes("Suspend now"), "an old focus is no reason now");
+  assert.ok(labels(open()).includes("Suspend now"));
+});
+
+test("a pending request is not sent again, and a newer request for the same terminal answers it", () => {
+  reset();
+  const view = open();
+  choose(view, "Suspend now");
+  const first = state.shared.get(REQUESTS).t7;
+  choose(view, "Suspending…");
+  assert.equal(state.shared.get(REQUESTS).t7, first, "no second request while the first waits");
+  leaderSays({}, { t7: { requested: first + 5, suspended: false, reason: "working", at: Date.now() } });
+  assert.ok(labels(view).includes("Can't suspend: working"), labels(view).join(", "));
+});
+
+test("a request that no copy of tab-tree answers within a minute says so", (t) => {
+  reset();
+  const view = open();
+  choose(view, "Suspend now");
+  const requested = state.shared.get(REQUESTS).t7;
+  t.mock.method(Date, "now", () => requested + 60_000);
+  assert.ok(labels(view).includes("Can't suspend: no answer from tab tree"), labels(view).join(", "));
+  // It can be asked again.
+  choose(view, "Can't suspend: no answer from tab tree");
+  assert.equal(state.shared.get(REQUESTS).t7, requested + 60_000);
 });
 
 test("a suspended agent's tab says it is already suspended", () => {
@@ -205,7 +236,7 @@ test("Suspend now still requests when a rule failed, to check again", () => {
   assert.ok(labels(view).includes("Suspending…"));
 });
 
-test("Never suspend pins the agent, and the item then offers to remove the pin", async () => {
+test("Never suspend pins the agent, and the item then offers to remove the pin", () => {
   reset();
   choose(open(), "Never suspend");
   assert.deepEqual(state.calls.filter(([kind]) => kind === "hc"), [["hc", "label", "t7", `${PIN}=1`]]);
