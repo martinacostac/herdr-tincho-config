@@ -11,7 +11,7 @@ const suspended = (root: "shell" | "agent", agent = "pi") => JSON.stringify({ ve
 const piLabels = (root: "shell" | "agent" = "agent") => ({ "herdr.suspended": suspended(root), "herdr.pi-recovery": PI_RECORD });
 const claudeLabels = (root: "shell" | "agent" = "agent") => ({ "herdr.suspended": suspended(root, "claude"), "herdr.claude-session": "claude-id" });
 
-type Options = { labels?: Record<string, string> | null; files?: Record<string, string>; env?: Record<string, string | undefined>; exec?: (argv: string[]) => string | null; hc?: (args: string[]) => { code: number; stdout: string } | undefined };
+type Options = { labels?: Record<string, string> | null; files?: Record<string, string>; env?: Record<string, string | undefined>; exec?: (argv: string[]) => string | null; hc?: (args: string[]) => { code: number; stdout: string } | undefined; saveFails?: boolean };
 
 function fake(options: Options = {}) {
   const writes: string[] = [];
@@ -34,7 +34,7 @@ function fake(options: Options = {}) {
       return { code: 0, stdout: "{}" };
     },
     readHead: async (path) => options.files && path in options.files ? options.files[path] ?? null : (path === SESSION_FILE ? '{"type":"session","id":"pi-id"}\n{"type":"message"}' : null),
-    save: async (path, text) => { steps.push(`save ${path}`); saved[path] = text; },
+    save: async (path, text) => { if (options.saveFails) throw new Error("read-only file system"); steps.push(`save ${path}`); saved[path] = text; },
     chdir: (path) => { steps.push(`chdir ${path}`); return null; },
     exec: (argv) => {
       steps.push(`exec ${argv[0]}`);
@@ -263,6 +263,14 @@ describe("wake", () => {
     expect(t.steps).toContain("chdir /project");
   });
 
+  test("Claude wakes with its recorded launch options, as recovery starts it", async () => {
+    const t = fake({ labels: { ...claudeLabels("agent"), "herdr.claude-options": JSON.stringify({ version: 1, options: ["--model", "haiku"] }) } });
+    await t.start(["claude", "t9", "worker"]);
+    await t.input(paste("hi"));
+    await t.tick(500);
+    expect(t.execs).toEqual([["claude", "--model", "haiku", "--resume", "claude-id", "--", "hi"]]);
+  });
+
   test("a failed replacement puts the label back and keeps the messages", async () => {
     const t = fake({ exec: () => "No such file or directory" });
     await t.start();
@@ -304,6 +312,26 @@ describe("missing session", () => {
       expect(reports(t.screen()).at(-1)).toBe("blocked");
     });
   }
+
+  test("repeated empty wakes (focus presses) report blocked once", async () => {
+    const t = fake({ labels: { "herdr.suspended": suspended("agent", "claude") } });
+    await t.start(["claude", "t3", "worker"]);
+    for (let i = 0; i < 3; i++) { await t.input("\r"); await t.tick(500); }
+    expect(reports(t.screen())).toEqual(["idle", "blocked"]);
+    await t.input(paste("a message"));
+    await t.tick(500);
+    expect(reports(t.screen())).toEqual(["idle", "blocked", "blocked"]);
+  });
+
+  test("when the file cannot be written, the messages are shown but kept out of the status", async () => {
+    const t = fake({ labels: { "herdr.suspended": suspended("agent", "claude") }, saveFails: true });
+    await t.start(["claude", "t3", "worker"]);
+    await t.input(paste("secret plan"));
+    await t.tick(500);
+    expect(t.screen()).toContain("secret plan");
+    const msg = t.screen().match(/state=blocked:app=herdr-standin:msg=([A-Za-z0-9+/=]+)/)![1];
+    expect(Buffer.from(msg, "base64").toString()).toBe("claude not woken: Claude has no session id. Could not save the messages: read-only file system");
+  });
 
   test("the undelivered folder defaults to ~/.local/state", async () => {
     const t = fake({ labels: { "herdr.suspended": suspended("agent", "claude") } });
