@@ -10,12 +10,20 @@
 
 **Blocked by:** 10 (same installer and installer tests)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Installer tests with disposable homes cover a missing config file
-- [ ] An existing config with other keys keeps them unchanged
-- [ ] An identical `shell` value causes no change
-- [ ] A conflicting value is reported and kept without `--force`
-- [ ] `--force` replaces the value and keeps a `.orig` copy of the original file
-- [ ] The skip path (no Bun) leaves the `shell` key unchanged
-- [ ] The existing installer tests still pass
+- [x] Installer tests with disposable homes cover a missing config file
+- [x] An existing config with other keys keeps them unchanged
+- [x] An identical `shell` value causes no change
+- [x] A conflicting value is reported and kept without `--force`
+- [x] `--force` replaces the value and keeps a `.orig` copy of the original file
+- [x] The skip path (no Bun) leaves the `shell` key unchanged
+- [x] The existing installer tests still pass
+
+## Comments
+
+Done in da37612 (implementation) and e501a29 (review fixes).
+
+- `install.sh`: `install_shell_key` runs at the end of `install_suspend`, so it is skipped without Bun or stand-in sources. It writes `shell = ["<absolute bin>/herdr-shell"]` to `$XDG_CONFIG_HOME/herdr-core/config.toml` (else `~/.config/...`). The hc binary reads `XDG_CONFIG_HOME` for its config, and ticket 01's disposable core used it. It changes only the top-level `shell` key, or adds the key after the last top-level key. An identical value (any spacing, a trailing comma, a literal string) is not written, so `--watch` does not rewrite it. A different value is reported and kept; `--force` replaces it and copies the file to `config.toml.orig`. A file with a multi-line string or a line it cannot read is reported and never edited, even with `--force`. It also leaves the key unchanged when `herdr-standin` is not installed (a first build failed). A linked config is written through the link.
+- `tests/install.test.sh`: 7 new cases with disposable homes (missing file, other keys and the mode kept, identical value, conflict and `--force`, no Bun, `XDG_CONFIG_HOME`, unreadable files and quoted keys), plus a check that `--watch` does not rewrite the file (same inode).
+- Not verified: busybox awk (only macOS awk was run).
