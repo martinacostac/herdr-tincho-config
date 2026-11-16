@@ -353,8 +353,11 @@ The design and the facts checked for it: [`plans/agent-suspension.md`](plans/age
 
 An agent is suspended only when all of these hold:
 
-- It's resumable: Claude or Pi, with its session label
-  (`herdr.claude-session`) or record (`herdr.pi-recovery`).
+- It's resumable: Claude with its session label (`herdr.claude-session`)
+  and that session's transcript (`~/.claude/projects/<folder>/<id>.jsonl`),
+  or Pi with its record (`herdr.pi-recovery`) and a session file that holds
+  the recorded session. When the transcript or session file is missing, the
+  automatic pass tries that agent again after 5 minutes.
 - It's `idle` or `done` for the threshold, counted from the later of its last
   status change and the last time its tab was focused.
 - Its tab isn't the focused tab of any Herdr window.
@@ -364,7 +367,9 @@ An agent is suspended only when all of these hold:
 - It runs no processes of its own except helpers. A helper is a process whose
   command line contains an entry of `helpers` (default `mcp`, which matches
   the MCP servers under each Pi agent). A process under a helper counts as
-  part of it. A dev server, a watcher or a build keeps the agent awake.
+  part of it. A dev server, a watcher or a build keeps the agent awake. For
+  an agent inside your shell, the shell's other jobs (`npm run dev &`) must
+  be helpers too.
 
 Child terminals don't count. They keep running when their parent is
 suspended, and a parent that waits on its children already counts as
@@ -373,6 +378,19 @@ suspended, and a parent that waits on its children already counts as
 One copy of `tab-tree` acts, even with several windows open. Right before it
 suspends an agent, it reads the terminal again and stops if anything changed.
 Suspension happens only while the Herdr app is open.
+
+How the agent's process ends depends on what hc started in the terminal:
+
+- **An agent that hc started directly** (`hc run pi …`, how herdr subagents
+  start) gets `SIGKILL`. Pi turns `SIGTERM` into a normal exit (code 0), and
+  hc ends a terminal whose program exits normally, even a kept one; no program
+  can turn `SIGKILL` into an exit. Then every process that was under the agent
+  (its MCP servers and their children) gets `SIGTERM`. Pi writes each entry of
+  its session file as it happens, so an idle Pi loses nothing.
+  `tests/suspend.integration.sh` checks both signals with a real Pi.
+- **An agent inside your shell**: the shell gets `SIGTERM`. hc counts that as
+  a lost program, and the agent exits cleanly with its session saved (fact F3
+  in the [plan](plans/agent-suspension.md)).
 
 ### Suspension settings
 
@@ -408,9 +426,10 @@ Right-click an agent tab on this machine:
 
 ### What you see
 
-- In the sidebar, a suspended agent's row has a dimmed name and icon and 💤.
-  While the agent starts again, the row shows "waking…". A stand-in that
-  can't wake the agent shows "Needs you".
+- In the sidebar, a suspended agent's row has a dimmed name and icon and 💤
+  (only while the stand-in or `herdr-shell` is in front). While the agent
+  starts again, the row shows "waking…". A stand-in that can't wake the
+  agent shows "Needs you".
 - In the terminal: the agent's last screen (with `restore_screen`), then a
   line like `💤 pi suspended at 14:05 · wakes on a message or when focused ·
   Enter wakes it`.
@@ -430,16 +449,35 @@ Right-click an agent tab on this machine:
 
 The agent starts from its exact session, in its recorded folder, with its
 launch options. An agent that ran inside your shell returns to a shell prompt
-when you exit it. An agent that hc started directly ends its terminal, as
-before.
+when you exit it (a login shell on macOS, as hc starts them). An agent that
+hc started directly ends its terminal, as before.
 
-A message sent while the terminal switches to the stand-in is refused by hc
-as `unavailable`. The sender can send it again.
+A message sent while the terminal switches to the stand-in never runs as a
+command. For a short moment hc has no program in the terminal and
+refuses the send as `unavailable`; the sender can send it again. After that,
+while `herdr-shell` and the stand-in start, hc delivers it: the text waits in
+the terminal's input, and the stand-in reads everything that arrived before
+it was ready as one message, with its lines joined by newlines. When
+`herdr-shell` waits on an error (below), it keeps the lines with text for
+the stand-in.
 
 When the session is gone (Pi's record names no session file, or the file is
-missing or has another id, or Claude has no session id), the stand-in doesn't wake the agent. It saves the
-messages in `${XDG_STATE_HOME:-~/.local/state}/herdr-tincho-config/undelivered/`,
-shows the file's path and reports `blocked`, so hc tells the parent.
+missing or has another id; Claude has no session id, or no transcript for
+it), the stand-in doesn't wake the agent. It saves the messages in
+`${XDG_STATE_HOME:-~/.local/state}/herdr-tincho-config/undelivered/`,
+shows the file's path and reports `blocked`, so hc tells the parent. A wake
+that fails for another reason, or an unexpected error in the stand-in, ends
+the same way. The stand-in never exits on its own, because a normal exit
+would end the kept terminal.
+
+A woken agent normally reports its status at once. Claude can miss that
+step, and hc would then show the stand-in's `working` report for good, so
+`hc wait` and `hc send --if idle` would treat the agent as busy. Right before
+it starts the agent, the stand-in leaves a small watchdog (`/bin/sh`). It
+reads the terminal once, 30 s later. If hc still shows the stand-in's report
+and the stand-in isn't in front, it reports `idle` for the terminal, once.
+In every other case it does nothing. The sidebar stops showing "waking…"
+after the same 30 s.
 
 ### Claude launch options
 
@@ -478,7 +516,8 @@ is the same as before.
   `tab-tree` removes the label at its next pass once the label is 60 s old.
   The stand-in and `herdr-shell` are left alone. A menu that just asked to
   suspend that agent then says "Can't suspend: stale suspension label
-  removed". A "waking…" that no agent ends clears after 30 s.
+  removed". A wake that no agent reports for is ended by the stand-in's
+  watchdog after 30 s (see [What wakes an agent](#what-wakes-an-agent)).
 
 ### Install
 
@@ -511,17 +550,24 @@ them even when they were changed on this machine.
 
 Every new terminal starts through `herdr-shell`. It reads its terminal's
 labels with `hc get` and starts the stand-in when the terminal is suspended,
-else your `$SHELL` (`/bin/sh` when unset). While hc restarts, it tries again
-for about 2 s. On any other error it shows the error and waits for Enter. It
-never starts a shell unless hc said the terminal isn't suspended. Nothing is
-suspended ("suspension not installed") until both programs are installed and
-`herdr-shell` is hc's `shell`.
+else your `$SHELL` (`/bin/sh` when unset), with the arguments hc gave it.
+hc starts login shells on macOS but runs a configured `shell` exactly as
+written, so on macOS, with no arguments, `herdr-shell` starts `$SHELL -l`.
+The stand-in's handover to your shell and the shell after an agent that ran
+inside it do the same. While hc restarts, `herdr-shell` tries again for
+about 2 s. On any other error it shows the error and waits for Enter on an
+empty line. It never starts a shell unless hc said the terminal isn't
+suspended. Nothing is suspended ("suspension not installed") until both
+programs are installed and `herdr-shell` is hc's `shell`.
 
 ### Idle work
 
 - One 15 s pass in each `tab-tree` copy; only the leading copy acts. It
   starts no process unless an agent is past its threshold, a **Suspend now**
-  request waits, or a stale label needs removing.
+  request waits, or a stale label needs removing. It checks the installation
+  at most every 5 minutes.
+- One watchdog per wake: a `/bin/sh` that sleeps 30 s, runs `hc get` once
+  and exits.
 - A 60 s heartbeat in Herdr's shared state keeps the leader choice. Every mod
   re-renders then.
 - One 1 s timer per focused suspended tab, cancelled when the focus moves.
@@ -533,6 +579,27 @@ suspended ("suspension not installed") until both programs are installed and
   are kept in memory, so after an app restart only the status time counts.
 - A message pasted milliseconds before the signal can be lost. Preventing
   that needs an hc change.
+- A send during the switch to the stand-in is refused only while hc has no
+  program in the terminal (a short moment). Later sends in the switch
+  arrive, but several of them become one message.
+- A helper is any process whose command line contains a `helpers` entry, so
+  with the default `mcp`, a dev server under a path such as
+  `~/projects/mcp-foo/` counts as a helper and doesn't keep its agent awake.
+- Claude started directly by hc (root agent) gets `SIGKILL` like Pi. That it
+  loses nothing then wasn't checked.
+- The watchdog's `idle` report has no app name. hc shows it until the woken
+  agent reports on its own.
+- `./install.sh` and `tab-tree` find the bin folder and herdr-core's config
+  from `XDG_DATA_HOME` and `XDG_CONFIG_HOME`. If the Herdr app runs with other
+  values than your shell, it reports "suspension not installed" or checks a
+  different config than the one hc reads. The check reads `config.toml`, not
+  the running core; whether a running core uses a new `shell` value for its
+  next program, or only after it restarts, wasn't checked.
+- **Suspend now** on an agent that an automatic suspension is suspending at
+  that moment can answer "Can't suspend: already suspended". A request made
+  in the same instant that the leader removes old requests can be lost; the
+  menu then says "no answer from tab tree" after a minute, and only when it
+  redraws.
 - Unsent text typed into an agent and left past the threshold is lost.
 - Every new terminal pays about 15 ms for the label check.
 - Bun's small ahead-of-time compile is experimental and canary only today.
@@ -552,8 +619,13 @@ suspended ("suspension not installed") until both programs are installed and
 sandbox, builds the stand-in and runs a disposable hc core under `/tmp` with
 fake Claude and Pi agents. It suspends both, sends a message to each, and
 checks the first prompt, the address, labels, parent and child, and that
-nothing ran in a shell. It never touches your core or agents. It isn't part
-of `node --test`.
+nothing ran in a shell. Then it starts two real Pi agents with `hc run`, in a
+throwaway `HOME` and with a fake MCP server: `SIGKILL` keeps the first
+terminal live with the stand-in and ends the helpers, and `SIGTERM` ends the
+second terminal with exit code 0. It needs `bun`, `node`, `fish`, `pi` and
+`hc`, and takes about a minute. It never touches your core or agents. It
+isn't part of `node --test`. From inside an agent sandbox, run it in a
+throwaway terminal: `hc run --rm --no-notify -- sh tests/suspend.integration.sh`.
 
 ## Mod: `tab-picker`
 

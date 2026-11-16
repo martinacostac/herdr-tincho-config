@@ -47,11 +47,18 @@ consolidated below.
   when a message arrives, when its tab stays focused for one second, or on
   Enter; the messages become the first prompt. Configurable with
   `tincho.suspend` (`after_minutes`, `helpers`; `false` or `0` turns automatic
-  suspension off).
+  suspension off). An agent that hc started directly gets `SIGKILL`, then its
+  helper processes `SIGTERM` (Pi turns `SIGTERM` into a normal exit, which
+  would end the terminal); a shell that hosts an agent gets `SIGTERM`. Claude
+  counts as resumable only with its transcript on disk, Pi only with a
+  session file that holds its session; otherwise messages are kept in an
+  `undelivered` file. On macOS, `herdr-shell` and the stand-in start your
+  shell as a login shell, as hc does.
 - Sidebar 💤 and "waking…" states, and **Suspend now** and **Never suspend**
   items in the tab menu, with the reason when an agent cannot be suspended.
-  Stale suspension labels and "waking…" states that no agent ends are
-  cleared on their own.
+  Stale suspension labels are removed on their own. A woken agent that never
+  reports its status is reported `idle` once by a watchdog after 30 s, so hc
+  and `hc wait` don't treat it as busy for good.
 - Claude launch options recorded in `herdr.claude-options` through an
   allow-list, and replayed by recovery and waking.
 - Installer builds the stand-in with Bun (ahead-of-time compile, else the

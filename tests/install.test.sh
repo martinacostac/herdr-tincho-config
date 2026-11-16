@@ -530,9 +530,35 @@ wait_log() {
     sleep 0.1
   done
 }
+# A fake sleep first on PATH for --watch: it records each poll's sleep in
+# $sleeps. install.sh exits when a source file disappears while a pass copies
+# it, so a test renames or removes sources only between passes. wait_idle
+# waits for two new sleeps: the second starts after a pass that saw every
+# earlier change, so no pass is running or due until the next change.
+real_sleep=$(command -v sleep)
+# watch_sleep <path>: sets watch_path to that PATH with the fake sleep first.
+watch_sleep() {
+  sleeps="$case_dir/sleeps"
+  mkdir -p "$case_dir/watch-bin"
+  : > "$sleeps"
+  printf '#!/bin/sh\necho >> "%s"\nexec "%s" "$@"\n' "$sleeps" "$real_sleep" > "$case_dir/watch-bin/sleep"
+  chmod +x "$case_dir/watch-bin/sleep"
+  watch_path="$case_dir/watch-bin:$1"
+}
+wait_idle() {
+  until_sleeps=$(($(wc -l < "$sleeps") + 2))
+  attempts=0
+  until [ "$(wc -l < "$sleeps")" -ge "$until_sleeps" ]; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 300 ] || fail 'watch did not finish its pass'
+    kill -0 "$watch_pid" 2>/dev/null || fail 'watch exited'
+    "$real_sleep" 0.1
+  done
+}
 fixture watch
+watch_sleep "$nobun_path"
 # exec avoids leaving the watched installer behind when the test kills its pid.
-(exec env -i PATH="$nobun_path" HOME="$home" XDG_STATE_HOME="$state" \
+(exec env -i PATH="$watch_path" HOME="$home" XDG_STATE_HOME="$state" \
   sh "$repo/install.sh" --watch > "$log" 2>&1) &
 watch_pid=$!
 wait_log 'pi: 5 installed, 0 skipped'
@@ -544,6 +570,7 @@ printf 'herdr-v3\n' > "$repo/herdr/mods/example/main.js"
 printf 'pi-v3\n' > "$repo/pi/extensions/herdr-recovery/index.ts"
 wait_same "$repo/herdr/mods/example/main.js" "$app/mods/example/main.js"
 wait_same "$repo/pi/extensions/herdr-recovery/index.ts" "$pi/extensions/herdr-recovery/index.ts"
+wait_idle
 mv "$repo/herdr/shared.txt" "$repo/herdr/renamed.txt"
 mv "$repo/pi/shared.txt" "$repo/pi/renamed.txt"
 wait_same "$repo/herdr/renamed.txt" "$app/renamed.txt"
@@ -558,7 +585,8 @@ echo 'ok - watch handles repeated same-size edits and renames in both trees'
 
 fixture watch-conditional
 rmdir "$home/.pi"
-(exec env -i PATH="$nobun_path" HOME="$home" XDG_STATE_HOME="$state" \
+watch_sleep "$nobun_path"
+(exec env -i PATH="$watch_path" HOME="$home" XDG_STATE_HOME="$state" \
   sh "$repo/install.sh" --watch > "$log" 2>&1) &
 watch_pid=$!
 wait_log 'pi: skipped'
@@ -568,6 +596,7 @@ mkdir "$home/.pi"
 # Existing --watch notices setup eligibility without requiring a source edit.
 wait_log 'pi: 5 installed, 0 skipped'
 wait_same "$repo/pi/extensions/herdr-recovery/index.ts" "$pi/extensions/herdr-recovery/index.ts"
+wait_idle
 cp "$record/installed-pi" "$case_dir/pi-record"
 mv "$home/.pi" "$home/saved-pi"
 # A Herdr edit gives us a deterministic completed pass after Pi is removed.
