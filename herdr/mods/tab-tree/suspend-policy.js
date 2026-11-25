@@ -356,8 +356,9 @@ const SEEN_MS = 24 * 60 * MINUTE;
 
 // A suspended agent wakes when its tab stays focused this long. Stepping past
 // tabs (⌘P, the next-agent command) moves on sooner and wakes nothing. A tab
-// that gets the focus because the focused tab closed wakes nothing either:
-// Herdr chose it, not you (Enter or a message still wakes it).
+// that gets the focus because the focused tab closed (closed by hand, or its
+// agent exited and took the tab) wakes nothing either: Herdr chose it, not
+// you (Enter or a message still wakes it).
 const WAKE_FOCUS_MS = 1_000;
 
 // A stand-in that waits for a message: the suspension label, and an idle

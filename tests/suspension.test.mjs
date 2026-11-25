@@ -560,6 +560,20 @@ test("a suspended agent whose tab gets the focus because the focused tab closed 
   assert.deepEqual(presses(), []);
 });
 
+test("an agent that exits and takes its focused tab with it hands the focus over: the next suspended agent is not woken", async () => {
+  resetCopies();
+  suspendT7();
+  const a = copy("a");
+  await render(a, "one", NOW);
+  // t1's program ends: its terminal, pane and tab go.
+  closeTab1();
+  terminalList = terminalList.filter((t) => t.address !== "t1");
+  windows.one = focusT7;
+  await render(a, "one", NOW + 10);
+  await elapse("one", NOW + 5000);
+  assert.deepEqual(presses(), []);
+});
+
 test("after a close, leaving the handed-over tab and coming back wakes it", async () => {
   resetCopies();
   suspendT7();
