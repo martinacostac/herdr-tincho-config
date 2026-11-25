@@ -355,7 +355,9 @@ const STALE_MS = 150_000;
 const SEEN_MS = 24 * 60 * MINUTE;
 
 // A suspended agent wakes when its tab stays focused this long. Stepping past
-// tabs (⌘P, the next-agent command) moves on sooner and wakes nothing.
+// tabs (⌘P, the next-agent command) moves on sooner and wakes nothing. A tab
+// that gets the focus because the focused tab closed wakes nothing either:
+// Herdr chose it, not you (Enter or a message still wakes it).
 const WAKE_FOCUS_MS = 1_000;
 
 // A stand-in that waits for a message: the suspension label, and an idle
@@ -365,7 +367,7 @@ const WAKE_FOCUS_MS = 1_000;
 const idleStandin = (t) => Object.hasOwn(t?.labels ?? {}, SUSPENDED) &&
   (t?.report?.app ?? t?.status?.app) === STANDIN_APP && statusOf(t) === "idle";
 
-/** @typedef {{ at: number, focused: Record<string, number>, seen: Record<string, number> }} WindowEntry */
+/** @typedef {{ at: number, focused: Record<string, number>, seen: Record<string, number>, handed?: string[] }} WindowEntry */
 
 // The entry point for other mods (ticket 09's "Suspend now" menu item).
 //
@@ -476,6 +478,11 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
   const since = new Map(); // this window's focused terminals -> since when
   /** @type {Map<string, number>} */
   const seen = new Map(); // terminal -> when it last left this window's focused tab
+  /** @type {Set<string>} */
+  const handed = new Set(); // focused terminals whose tab got the focus when the focused tab closed
+  /** @type {string | null} */
+  let lastTab = null; // this window's last focused tab
+  let afterClose = false; // the last focused tab closed; the next focus is handed over
   let published = -Infinity;
   let focusChanged = true; // the entry must be (re)published
   let due = false; // observe() asked for an act()
@@ -508,14 +515,25 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
   /** @param {number} now */
   function track(now) {
     const here = focusedHere();
+    const tab = focused()?.tab ?? null;
+    // The focused tab is gone (closed): Herdr focuses another one.
+    if (lastTab !== null && tab !== lastTab && !panes().some((p) => p.tab === lastTab)) afterClose = true;
+    if (tab !== null) lastTab = tab;
     let changed = false;
     for (const address of [...since.keys()]) {
       if (here.has(address)) continue;
       since.delete(address);
+      handed.delete(address);
       seen.set(address, now);
       changed = true;
     }
-    for (const address of here) if (!since.has(address)) { since.set(address, now); changed = true; }
+    for (const address of here) {
+      if (since.has(address)) continue;
+      since.set(address, now);
+      if (afterClose) handed.add(address);
+      changed = true;
+    }
+    if (here.size) afterClose = false;
     const keep = Math.max(SEEN_MS, (suspendSettings().afterMinutes ?? 0) * MINUTE);
     for (const [address, at] of seen) if (now - at >= keep) seen.delete(address);
     return changed;
@@ -530,7 +548,7 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
     /** @type {Record<string, WindowEntry>} */
     const entries = {};
     for (const [other, entry] of Object.entries(windowEntries())) if (other !== id && fresh(entry, now)) entries[other] = entry;
-    entries[id] = { at: now, focused: Object.fromEntries(since), seen: Object.fromEntries(seen) };
+    entries[id] = { at: now, focused: Object.fromEntries(since), seen: Object.fromEntries(seen), handed: [...handed] };
     setShared(SUSPEND_WINDOWS, entries);
     published = now;
   }
@@ -551,16 +569,21 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
   function focusView(now) {
     const focused = new Map(since);
     const last = new Map(seen);
+    // Focused by choice in some window (not handed over by a close).
+    const chosen = new Map([...since].filter(([address]) => !handed.has(address)));
     for (const [other, entry] of Object.entries(windowEntries())) {
       if (other === id || !fresh(entry, now)) continue;
+      const handedThere = new Set(Array.isArray(entry.handed) ? entry.handed : []);
       for (const [address, at] of Object.entries(record(entry.focused))) {
-        if (Number.isFinite(at)) focused.set(address, Math.min(focused.get(address) ?? Infinity, at));
+        if (!Number.isFinite(at)) continue;
+        focused.set(address, Math.min(focused.get(address) ?? Infinity, at));
+        if (!handedThere.has(address)) chosen.set(address, Math.min(chosen.get(address) ?? Infinity, at));
       }
       for (const [address, at] of Object.entries(record(entry.seen))) {
         if (Number.isFinite(at)) last.set(address, Math.max(last.get(address) ?? -Infinity, at));
       }
     }
-    return { focused, last };
+    return { focused, last, chosen };
   }
 
   /** @param {ReturnType<typeof focusView>} view @param {string} address */
@@ -571,9 +594,9 @@ export function createSuspender({ id = `${Date.now().toString(36)}-${Math.random
   function wakeTargets(now) {
     /** @type {Map<string, number>} */
     const targets = new Map();
-    const { focused } = focusView(now);
-    if (!focused.size) return targets;
-    for (const [address, at] of focused) if (!remote(address) && idleStandin(terminalAt(address))) targets.set(address, at);
+    const { chosen } = focusView(now);
+    if (!chosen.size) return targets;
+    for (const [address, at] of chosen) if (!remote(address) && idleStandin(terminalAt(address))) targets.set(address, at);
     return targets;
   }
 

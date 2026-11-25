@@ -446,7 +446,9 @@ Right-click an agent tab on this machine:
   arrive within 500 ms of the first one go in together, as one first prompt.
   The stand-in never runs what it receives.
 - **Focus**: its tab stays focused for 1 second. Stepping past tabs with ⌘P
-  or the next-agent command wakes nothing.
+  or the next-agent command wakes nothing. Neither does the focus Herdr moves
+  there when you close the focused tab: press Enter, or leave the tab and come
+  back.
 - **Enter** on an empty line in the stand-in, also through `hc attach` from a
   plain terminal. The agent wakes with no prompt.
 

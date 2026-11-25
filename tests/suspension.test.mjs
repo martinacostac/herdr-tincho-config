@@ -532,6 +532,74 @@ test("stepping past a suspended agent's tab wakes nothing: its timer is cancelle
   assert.deepEqual(presses(), []);
 });
 
+// Closing the focused tab makes Herdr focus another one: Herdr chose it.
+const closeTab1 = () => { paneList = paneList.filter((p) => p.tab !== "tab-1"); };
+
+test("a suspended agent whose tab gets the focus because the focused tab closed is not woken", async () => {
+  resetCopies();
+  suspendT7();
+  const a = copy("a");
+  await render(a, "one", NOW);
+  closeTab1();
+  windows.one = focusT7;
+  await render(a, "one", NOW + 10);
+  await elapse("one", NOW + 5000);
+  assert.deepEqual(timers, []);
+  assert.deepEqual(presses(), []);
+  // Also when the window shows no focus between the close and the next tab.
+  resetCopies();
+  suspendT7();
+  const b = copy("b");
+  await render(b, "one", NOW);
+  closeTab1();
+  windows.one = null;
+  await render(b, "one", NOW + 5);
+  windows.one = focusT7;
+  await render(b, "one", NOW + 10);
+  await elapse("one", NOW + 5000);
+  assert.deepEqual(presses(), []);
+});
+
+test("after a close, leaving the handed-over tab and coming back wakes it", async () => {
+  resetCopies();
+  suspendT7();
+  const a = copy("a");
+  await render(a, "one", NOW);
+  closeTab1();
+  windows.one = focusT7;
+  await render(a, "one", NOW + 10);
+  windows.one = { ...focusT7, tab: "tab-8", pane: "pane-8", terminal: "t8" };
+  await render(a, "one", NOW + 500);
+  windows.one = focusT7;
+  await render(a, "one", NOW + 2000);
+  await elapse("one", NOW + 3000);
+  assert.deepEqual(presses(), [["hc", "keys", "t7", "enter"]]);
+});
+
+test("a tab handed over in one window still wakes when another window chose it", async () => {
+  resetCopies();
+  suspendT7();
+  const a = copy("a");
+  const b = copy("b");
+  await render(a, "one", NOW);
+  await render(b, "two", NOW);
+  closeTab1();
+  windows.one = focusT7;
+  await render(a, "one", NOW + 10);
+  await elapse("one", NOW + 5000);
+  assert.deepEqual(presses(), []);
+  // Window two moves to t7 by choice (its last tab, tab-1, is gone too, but
+  // it leaves through tab-8 first).
+  paneList = [...paneList];
+  windows.two = { ...focusT7, tab: "tab-8", pane: "pane-8", terminal: "t8" };
+  await render(b, "two", NOW + 5010);
+  windows.two = focusT7;
+  await render(b, "two", NOW + 5020);
+  await render(a, "one", NOW + 5030);
+  await elapse("one", NOW + 7000);
+  assert.deepEqual(presses(), [["hc", "keys", "t7", "enter"]]);
+});
+
 test("a wake timer that fires after the focus moved, before any render, wakes nothing", async () => {
   resetCopies();
   suspendT7();
