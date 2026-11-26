@@ -6,7 +6,8 @@
 // The stand-in imports this file at build time, so it must never import
 // "herdr", and a change here needs a stand-in rebuild.
 
-import { SESSION, PI_RECOVERY, CLAUDE_OPTIONS, shellQuote, piRecovery, claudeOptionsRecord } from "./recipes.js";
+import { SESSION, PI_RECOVERY, CLAUDE_OPTIONS, shellQuote, piRecovery } from "./recipes.js";
+import { claudeOptionsRecord } from "./claude-options.js";
 
 export const RESUME = "herdr.resume";
 

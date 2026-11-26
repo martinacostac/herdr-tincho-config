@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { CLAUDE_OPTIONS, claudeOptions, claudeOptionsLabel, claudeOptionsRecord } from "../herdr/mods/tab-tree/recipes.js";
+import { CLAUDE_OPTIONS } from "../herdr/mods/tab-tree/recipes.js";
+import { claudeOptions, claudeOptionsLabel, claudeOptionsRecord } from "../herdr/mods/tab-tree/claude-options.js";
 
 // The words after the program, as Claude's foreground argv shows them (F2).
 test("the launch options seen for F2 are kept, and the prompt after them is dropped", () => {
@@ -127,4 +128,10 @@ test("a record with anything but kept options is ignored, so a label written by 
   assert.deepEqual(claudeOptionsRecord(JSON.stringify({ version: 1, options: [] })), []);
   assert.deepEqual(claudeOptionsRecord(JSON.stringify({ version: 1, options: ["--tools", "", "--add-dir", "/a", "~/b", "--verbose"] })),
     ["--tools", "", "--add-dir", "/a", "~/b", "--verbose"]);
+});
+
+test("the allowlist module imports nothing, so the reporter and the stand-in can build it without the Herdr host", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const source = await readFile(new URL("../herdr/mods/tab-tree/claude-options.js", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /^\s*import\b|\bimport\s*\(|\brequire\s*\(/m);
 });
