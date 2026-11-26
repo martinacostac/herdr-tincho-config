@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { CLAUDE_OPTIONS } from "../herdr/mods/tab-tree/recipes.js";
-import { claudeOptions, claudeOptionsLabel, claudeOptionsRecord } from "../herdr/mods/tab-tree/claude-options.js";
+import { claudeOptions, claudeOptionsRecord } from "../herdr/mods/tab-tree/claude-options.js";
 
 // The words after the program, as Claude's foreground argv shows them (F2).
 test("the launch options seen for F2 are kept, and the prompt after them is dropped", () => {
@@ -96,13 +96,10 @@ test("the --name=value form is read like two words", () => {
   assert.deepEqual(claudeOptions(["--plugin-dir=p", "--model=", "--"], "/w"), ["--plugin-dir", "/w/p", "--model", ""]);
 });
 
-test("the label holds a versioned record of the options, and no label means no options", () => {
+test("the old label holds a versioned record of the options", () => {
   assert.equal(CLAUDE_OPTIONS, "herdr.claude-options");
-  const raw = claudeOptionsLabel(["--model", "haiku", "--add-dir", "lib", "--", "<prompt>"], "/work");
-  assert.deepEqual(JSON.parse(raw), { version: 1, options: ["--model", "haiku", "--add-dir", "/work/lib"] });
+  const raw = JSON.stringify({ version: 1, options: ["--model", "haiku", "--add-dir", "/work/lib"] });
   assert.deepEqual(claudeOptionsRecord(raw), ["--model", "haiku", "--add-dir", "/work/lib"]);
-  assert.equal(claudeOptionsLabel(["<prompt>"], "/work"), null);
-  assert.equal(claudeOptionsLabel(["--resume", "id", "--model", "haiku"], "/work"), null);
 });
 
 test("malformed, future-version and control-containing records are ignored", () => {

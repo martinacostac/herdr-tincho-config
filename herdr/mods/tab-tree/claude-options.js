@@ -116,16 +116,9 @@ export function claudeOptions(words, cwd) {
   return kept.filter(([name]) => !dropped.has(CLAUDE_NEEDS.get(name))).flat();
 }
 
-// The CLAUDE_OPTIONS label for those words: a versioned record, or null (no
-// label) when no option is kept.
-/** @param {unknown[]} words @param {unknown} [cwd] @returns {string | null} */
-export function claudeOptionsLabel(words, cwd) {
-  const options = claudeOptions(words, cwd);
-  return options.length ? JSON.stringify({ version: 1, options }) : null;
-}
-
-// The options in a CLAUDE_OPTIONS label, or null. Only a record that the
-// parser itself would write counts, so a label set by hand adds no other option.
+// The options in an old herdr.claude-options label ({ version: 1, options }),
+// or null. Only a record that the allowlist itself would keep counts, so a
+// label set by hand adds no other option.
 /** @param {unknown} raw @returns {string[] | null} */
 export function claudeOptionsRecord(raw) {
   try {

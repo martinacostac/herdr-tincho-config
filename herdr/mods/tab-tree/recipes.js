@@ -1,7 +1,7 @@
 // What herdr-tincho-config still knows of each agent, now that recovery,
 // the suspension rules and the stand-in read its resume report
 // (resume-report.js): the label names, the old labels' formats (read by the
-// legacy adapter and the Claude polling), the suspension record, and the
+// legacy adapter), the suspension record, and the
 // session picker ↻ opens without a report (spec Q1). The stand-in imports this
 // file at build time, so it must never import "herdr", and a change here needs
 // a stand-in rebuild.
@@ -34,10 +34,6 @@ export function piRecovery(raw) {
     return value;
   } catch { return null; }
 }
-
-// The Claude allowlist lives in claude-options.js. Re-exported for the Claude
-// polling (resume.js), which ticket 06 of the resume-report feature removes.
-export { claudeOptions, claudeOptionsLabel, claudeOptionsRecord } from "./claude-options.js";
 
 // The record a suspension leaves in SUSPENDED: which agent to wake (its
 // report's agent key), whether a shell hosted it ("shell") or hc started it

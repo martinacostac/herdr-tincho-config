@@ -58,7 +58,8 @@ describe("each SessionStart source", () => {
       const [label, terminal, agent, resume, ...rest] = h.calls[0];
       expect([label, terminal, agent]).toEqual(["label", "t42", "herdr.last-agent=claude"]);
       expect(resume.startsWith("herdr.resume=")).toBe(true);
-      expect(rest).toEqual([]);
+      // The old polling's labels are cleared in the same call.
+      expect(rest).toEqual(["herdr.claude-session=", "herdr.claude-options="]);
       expect(JSON.parse(resumeIn(h.calls[0]))).toEqual({
         version: 1, agent: "claude", session: SESSION, argv: ["claude", "--model", "haiku", "--resume", SESSION],
         cwd: "/work", proof: PROOF, pid: 500, at: NOW,
@@ -70,7 +71,7 @@ describe("each SessionStart source", () => {
     for (const source of ["startup", "clear"]) {
       const h = harness({ hook: hookInput(source), files: [] });
       await h.run();
-      expect(h.calls).toEqual([["label", "t42", "herdr.last-agent=claude", "herdr.resume="]]);
+      expect(h.calls).toEqual([["label", "t42", "herdr.last-agent=claude", "herdr.resume=", "herdr.claude-session=", "herdr.claude-options="]]);
     }
   });
 });

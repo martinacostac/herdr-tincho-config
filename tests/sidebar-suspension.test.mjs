@@ -197,7 +197,7 @@ test("the narrow sidebar drops a stale waking report too", () => {
 test("a waking row re-renders by itself when its 30 s end, with a one-shot sleep and no new timer", async () => {
   const { sleeps, timers, notified } = render(standin("working"), wokenCore(["pi", "", ""], NOW - 10_000));
   assert.deepEqual(sleeps.map(({ ms }) => ms), [20_000]);
-  assert.deepEqual(timers, [3000, 10000, 15000]);
+  assert.deepEqual(timers, [3000, 15000]);
   await new Promise((resolve) => setImmediate(resolve)); // the render's other tasks
   const before = notified();
   sleeps[0].resolve();

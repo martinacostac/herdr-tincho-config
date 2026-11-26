@@ -4,11 +4,9 @@
 // core keeps the labels across restarts.
 
 import { hc, exec } from "herdr";
-import { isClaude, processIdentity, claudeLaunchWords } from "./claude-polling.js";
-
-import { LABEL, SESSION, CLAUDE_OPTIONS, SUSPENDED, STANDIN_APP, pickerLine, claudeOptionsLabel } from "./recipes.js";
+import { LABEL, SUSPENDED, STANDIN_APP, pickerLine } from "./recipes.js";
 import { reportOf, resumeLine, proofHeld } from "./resume-report.js";
-export { LABEL, SESSION, hasPicker } from "./recipes.js";
+export { LABEL, hasPicker } from "./recipes.js";
 
 // Types a command line into the terminal's shell, so the person's own agent
 // commands (functions, wrappers) run it.
@@ -229,36 +227,4 @@ export async function reportHeld(report) {
 
 export function remember(address, agent) {
   return hc(["label", address, `${LABEL}=${agent}`]);
-}
-
-// The Claude session running in front in a terminal, or null: its id and its
-// CLAUDE_OPTIONS label value (null: no options). Claude writes
-// ~/.claude/sessions/<pid>.json for each running process (sessionId follows
-// /clear and /resume inside it). The options come from the argv of that same
-// process.
-export async function claudeLaunch(address, expected) {
-  const j = await info(address);
-  const pid = j?.foreground?.pid;
-  if (j?.state !== "live" || !isClaude(j) || !Number.isSafeInteger(pid) || pid <= 0) return null;
-  if ((expected?.pid != null && expected.pid !== j.pid) ||
-      (expected?.foreground?.pid != null && expected.foreground.pid !== pid)) return null;
-  const identity = processIdentity(j);
-  const options = claudeOptionsLabel(claudeLaunchWords(j), j.foreground.cwd);
-  const r = await exec("sh", ["-c", 'cat "$HOME/.claude/sessions/$1.json"', "sh", String(pid)]).catch(() => null);
-  let id;
-  try { id = r?.code === 0 ? JSON.parse(r.stdout).sessionId : null; } catch { return null; }
-  if (typeof id !== "string" || !id || /[\x00-\x1f\x7f]/.test(id)) return null;
-  // The file read yields to other work. Reject a process switch even if the
-  // app's terminals() snapshot has not caught up with the core yet.
-  const after = await info(address);
-  return after?.state === "live" && isClaude(after) && processIdentity(after) === identity ? { id, options } : null;
-}
-
-// Writes what changed of a claudeLaunch result, in one label call: the
-// session, and the options (removed when the process has none).
-export async function rememberClaudeLaunch(address, { id, options }, labels = {}) {
-  const changes = [];
-  if (labels[SESSION] !== id) changes.push(`${SESSION}=${id}`);
-  if ((labels[CLAUDE_OPTIONS] ?? null) !== options) changes.push(`${CLAUDE_OPTIONS}=${options ?? ""}`);
-  return changes.length ? hc(["label", address, ...changes]) : null;
 }

@@ -18,8 +18,7 @@
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, panes, terminals, machines, run, openOverlay, theme, shared, setShared, exec, hc, home, layout } from "herdr";
-import { LABEL, WAKE_MS, createRecovery, recoverable, remember, claudeLaunch, rememberClaudeLaunch, waking, frontProgram, holderInFront } from "./resume.js";
-import { claudeCandidate, processIdentity } from "./claude-polling.js";
+import { LABEL, WAKE_MS, createRecovery, recoverable, remember, waking, frontProgram, holderInFront } from "./resume.js";
 import { SUSPENDED, STANDIN_APP, suspension } from "./recipes.js";
 import { createSuspender } from "./suspend-policy.js";
 
@@ -107,8 +106,6 @@ export default class TabTree extends View {
     this.labeling = new Set(); // `${address}=${agent}` labels on their way to the core
     this.labels = new Map(); // address -> its core labels, as of the last render
     cx.timer.every(3000, (cx) => this.remember(cx));
-    this.sessionsBusy = false;
-    cx.timer.every(10000, (cx) => this.rememberSessions(cx));
     // One policy per copy; only the leading copy acts (several windows can
     // show tab-tree at once). Focus and manual requests are observed in
     // render; the 15 s pass is the only periodic work (it never overlaps
@@ -239,36 +236,6 @@ export default class TabTree extends View {
         await remember(p.terminal, agent).catch(() => null);
         this.labeling.delete(key);
       });
-    }
-  }
-
-  // Labels each local terminal running Claude with its session id (SESSION)
-  // and launch options (CLAUDE_OPTIONS), so recovery (↻) and a wake continue
-  // that exact conversation, started the same way. One pass at a time, terminals in turn.
-  rememberSessions(cx) {
-    if (this.sessionsBusy) return;
-    // Every core terminal, not panes(): sub-agents run in terminals no pane lists.
-    const todo = terminals().filter(claudeCandidate).map((t) => ({ address: t.address, identity: processIdentity(t) }));
-    if (!todo.length) return;
-    this.sessionsBusy = true;
-    try {
-      cx.spawn(async () => {
-        try {
-          for (const { address, identity } of todo) {
-            const current = () => terminals().find((t) => t.address === address && claudeCandidate(t) && processIdentity(t) === identity);
-            const before = current();
-            if (!before) continue;
-            const found = await claudeLaunch(address, before).catch(() => null);
-            const after = current();
-            if (found && after) await rememberClaudeLaunch(address, found, after.labels ?? {}).catch(() => null);
-          }
-        } finally {
-          this.sessionsBusy = false;
-        }
-      });
-    } catch (error) {
-      this.sessionsBusy = false;
-      throw error;
     }
   }
 

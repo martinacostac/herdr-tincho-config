@@ -10,7 +10,7 @@
 // it with fakes.
 
 import { claudeOptions } from "../herdr/mods/tab-tree/claude-options.js";
-import { LABEL } from "../herdr/mods/tab-tree/recipes.js";
+import { LABEL, SESSION, CLAUDE_OPTIONS } from "../herdr/mods/tab-tree/recipes.js";
 import { RESUME, parseReport } from "../herdr/mods/tab-tree/resume-report.js";
 
 export interface ReportIo {
@@ -91,11 +91,10 @@ export async function report(agent: string | undefined, io: ReportIo): Promise<v
     if (!claude || isPrint(claude.argv)) return;
     const value = reportValue(hook, claude, io);
     if (value === null) return;
-    // The old herdr.claude-session and herdr.claude-options labels are left
-    // alone: the Claude polling in tab-tree rewrites them within 10 s, and the
-    // mod ignores them once herdr.resume exists. Ticket 06 removes the polling
-    // and adds their removal here.
-    await io.hc(["label", terminal, `${LABEL}=claude`, `${RESUME}=${value}`]);
+    // The same call clears the labels the Claude polling used to write
+    // (herdr.claude-session, herdr.claude-options): the legacy adapter reads
+    // them only while herdr.resume is missing, and this one never is again.
+    await io.hc(["label", terminal, `${LABEL}=claude`, `${RESUME}=${value}`, `${SESSION}=`, `${CLAUDE_OPTIONS}=`]);
   } catch {
     // A failed write is retried by the next hook (the next reply).
   }

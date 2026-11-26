@@ -8,7 +8,7 @@
 import { settings, focused, panes, terminals, shared, setShared, readTextFile, exec, hc } from "herdr";
 import { SUSPENDED, STANDIN_APP, suspension } from "./recipes.js";
 import { reportOf } from "./resume-report.js";
-import { isClaude } from "./claude-polling.js";
+import { isClaude } from "./claude-process.js";
 import { frontProgram, holderInFront, reportHeld } from "./resume.js";
 
 export const NEVER_SUSPEND = "herdr.never-suspend";
