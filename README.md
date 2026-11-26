@@ -628,6 +628,8 @@ programs are installed and `herdr-shell` is hc's `shell`.
 - A 60 s heartbeat in Herdr's shared state keeps the leader choice. Every mod
   re-renders then.
 - About 15 ms per new terminal for `herdr-shell`'s label check.
+- No labeling timer: `herdr.last-agent` is written from render, when a pane
+  shows an agent its terminal hasn't recorded yet (one `hc label`, once).
 
 ### Known limits
 

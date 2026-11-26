@@ -105,11 +105,10 @@ export default class TabTree extends View {
     this.asking = new Set();
     this.labeling = new Set(); // `${address}=${agent}` labels on their way to the core
     this.labels = new Map(); // address -> its core labels, as of the last render
-    cx.timer.every(3000, (cx) => this.remember(cx));
     // One policy per copy; only the leading copy acts (several windows can
-    // show tab-tree at once). Focus and manual requests are observed in
-    // render; the 15 s pass is the only periodic work (it never overlaps
-    // itself).
+    // show tab-tree at once). Focus, manual requests and the last-agent labels
+    // are handled from render; the 15 s pass is the only periodic work (it
+    // never overlaps itself).
     this.suspender = createSuspender();
     cx.timer.every(15000, (cx) => cx.spawn(() => this.suspender.pass()));
     this.refresh(cx);
@@ -743,6 +742,7 @@ export default class TabTree extends View {
   render(cx) {
     this.watch(cx);
     this.observeSuspension(cx);
+    this.remember(cx);
     const t = theme();
     const collapsed = narrow();
     const now = this.now();

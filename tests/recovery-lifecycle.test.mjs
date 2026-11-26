@@ -242,7 +242,7 @@ test("Claude retries remain serial, bounded, and hold queued Pi until they finis
   ]);
   assert.equal(copy.owner.sleeps.length, 120);
   assert.ok(copy.owner.sleeps.every(({ ms }) => ms === 500));
-  assert.deepEqual(copy.owner.timers.map(({ ms }) => ms), [3000, 15000], "polling intervals unchanged");
+  assert.deepEqual(copy.owner.timers.map(({ ms }) => ms), [15000], "the suspension pass is the only periodic work");
 });
 
 test("closing one simultaneous sidebar does not cancel another owner's queue", async () => {
