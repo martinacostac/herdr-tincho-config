@@ -1,6 +1,6 @@
 # 04: Pi's extension writes the resume report
 
-Status: ready-for-agent
+Status: done
 Type: task
 Blocked by: 02
 
