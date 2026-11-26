@@ -58,7 +58,10 @@ test("the line for ↻ quotes every word, the program and the folder too", () =>
 test("herdr.resume wins over the old labels; without it the old labels make the report", () => {
   const pi = JSON.stringify({ version: 1, sessionId: "old", sessionFile: "/s/old.jsonl", cwd: "/p", args: ["--thinking", "high"] });
   assert.equal(reportOf({ [RESUME]: raw(), [PI_RECOVERY]: pi })?.session, "0193b6c2");
-  assert.equal(reportOf({ [RESUME]: "", [PI_RECOVERY]: pi })?.session, "old");
+  assert.equal(reportOf({ [PI_RECOVERY]: pi })?.session, "old");
+  // An empty or broken herdr.resume is "nothing to resume": the old labels name an older conversation.
+  assert.equal(reportOf({ [RESUME]: "", [PI_RECOVERY]: pi }), null);
+  assert.equal(reportOf({ [RESUME]: "{", [PI_RECOVERY]: pi }), null);
   assert.equal(reportOf(undefined), null);
   assert.equal(reportOf({}), null);
 });

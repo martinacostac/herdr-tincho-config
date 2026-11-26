@@ -1,9 +1,12 @@
-// How each agent starts again: shared by recovery (which types it into the
-// terminal's shell) and the stand-in (which replaces itself with it). The
-// stand-in imports this file at build time, so it must never import "herdr",
-// and a change here needs a stand-in rebuild.
+// What herdr-tincho-config still knows of each agent, now that recovery,
+// the suspension rules and the stand-in read its resume report
+// (resume-report.js): the label names, the old labels' formats (read by the
+// legacy adapter and the Claude polling), the suspension record, and the
+// session picker ↻ opens without a report (spec Q1). The stand-in imports this
+// file at build time, so it must never import "herdr", and a change here needs
+// a stand-in rebuild.
 
-// Persistent terminal labels. Agent-specific data must never cross recipes.
+// Persistent terminal labels.
 export const LABEL = "herdr.last-agent";
 export const SESSION = "herdr.claude-session";
 export const PI_RECOVERY = "herdr.pi-recovery";
@@ -155,94 +158,47 @@ export function claudeOptionsRecord(raw) {
   } catch { return null; }
 }
 
-// The record a suspension leaves in SUSPENDED: which agent to wake, whether a
-// shell hosted it ("shell") or hc started it directly ("agent"), the folder it
-// ran in, and when it was suspended (ms). Anything else is not a suspension.
-/** @typedef {{ version: 1, agent: "claude" | "pi", root: "shell" | "agent", cwd: string, since: number }} Suspension */
+// The record a suspension leaves in SUSPENDED: which agent to wake (its
+// report's agent key), whether a shell hosted it ("shell") or hc started it
+// directly ("agent"), the folder it ran in, and when it was suspended (ms).
+// Anything else is not a suspension.
+/** @typedef {{ version: 1, agent: string, root: "shell" | "agent", cwd: string, since: number }} Suspension */
 /** @param {string | undefined} raw @returns {Suspension | null} */
 export function suspension(raw) {
   try {
-    const value = JSON.parse(raw);
-    if (value?.version !== 1 || !Object.hasOwn(STARTS, value.agent) || !["shell", "agent"].includes(value.root)) return null;
+    const value = JSON.parse(/** @type {string} */ (raw));
+    if (value?.version !== 1 || typeof value.agent !== "string" || !/^[a-z0-9-]+$/.test(value.agent) || !["shell", "agent"].includes(value.root)) return null;
     if (!absolute(value.cwd) || !Number.isSafeInteger(value.since) || value.since < 0) return null;
     return { version: 1, agent: value.agent, root: value.root, cwd: value.cwd, since: value.since };
   } catch { return null; }
 }
 
-// Whether a Pi session file still holds the recorded session, from the start
-// of the file (its first line is the header). A missing or empty file would
-// start a NEW conversation, and a replaced one another conversation.
-/** @param {unknown} head @param {unknown} sessionId @returns {boolean} */
-export function holdsPiSession(head, sessionId) {
-  if (typeof head !== "string" || !printable(sessionId)) return false;
-  try {
-    const header = JSON.parse(head.split("\n")[0]);
-    return header?.type === "session" && header.id === sessionId;
-  } catch { return false; }
-}
-
-// Each start: the folder it must run in (null: any folder, the terminal's own)
-// and its words. A word from the terminal's records is wrapped by recorded();
-// the recipe's own words are plain strings.
-// Claude keeps its existing id -> tab name -> picker order. Its launch options
-// go before --resume, so a resumed Claude shows them where the session poller
-// reads them (an option with an optional value, like --resume, stops capture).
-/** @typedef {string | { recorded: string }} Word */
-/** @param {string} word @returns {Word} */
-const recorded = (word) => ({ recorded: word });
-/** @type {Record<string, (input: any) => { cwd: string | null, words: Word[] }>} */
-const STARTS = {
-  claude: ({ session, tab, options = [] }) => ({ cwd: null,
-    words: ["claude", ...options.map(recorded), "--resume", ...(session ? [recorded(session)] : tab ? [recorded(tab)] : [])] }),
-  pi: ({ recovery, picker = false }) => {
-    if (!recovery) return { cwd: null, words: ["pi", "--resume"] };
-    // An ID looked up from another folder can fork instead of resume. The
-    // picker also needs the recorded folder when its exact file is unavailable.
-    const cwd = picker || !recovery.sessionFile ? recovery.cwd : null;
-    const args = recovery.args.map(recorded);
-    if (picker) return { cwd, words: ["pi", "--resume", ...args] };
-    return { cwd, words: ["pi", "--session", recorded(recovery.sessionFile ?? recovery.sessionId), ...args] };
+// ↻ without a resume report, or with one whose conversation is not on disk
+// (spec Q1): the agent's own session picker, never a new conversation. Only
+// ↻ uses it; a suspension needs a report. tab: the tab's name, which Claude's
+// picker opens on. report: the report whose proof is missing, for its folder
+// (Pi's picker lists that folder's sessions) and Pi's launch options.
+/** @typedef {{ tab?: string | null, report?: { agent: string, argv: string[], cwd: string } | null }} PickerInput */
+/** @type {Record<string, (input: PickerInput) => { cwd: string | null, argv: string[] }>} */
+const PICKERS = {
+  claude: ({ tab, report }) => ({ cwd: report?.agent === "claude" ? report.cwd : null, argv: ["claude", "--resume", ...(tab ? [tab] : [])] }),
+  pi: ({ report }) => {
+    if (report?.agent !== "pi") return { cwd: null, argv: ["pi", "--resume"] };
+    // pi --session <file> <options>: the picker keeps the options.
+    const options = report.argv[1] === "--session" ? report.argv.slice(3) : [];
+    return { cwd: report.cwd, argv: ["pi", "--resume", ...options] };
   },
-  // Not verified on this machine:
-  // codex: () => ({ cwd: null, words: ["codex", "resume", "--last"] }),
 };
 
-// What each start needs, read from the terminal's labels. A new label only
-// changes this table, never the callers.
-const INPUTS = {
-  claude: (labels, { tab }) => ({ session: labels[SESSION], tab, options: claudeOptionsRecord(labels[CLAUDE_OPTIONS]) ?? [] }),
-  pi: (labels, { picker }) => ({ recovery: piRecovery(labels[PI_RECOVERY]), picker }),
-};
+// Whether ↻ has a picker for this agent.
+/** @param {unknown} agent @returns {agent is string} */
+export const hasPicker = (agent) => typeof agent === "string" && Object.hasOwn(PICKERS, agent);
 
-const startFor = (agent, labels, options) =>
-  Object.hasOwn(STARTS, agent) ? STARTS[agent](INPUTS[agent](labels ?? {}, options ?? {})) : null;
-
-/** @param {Word} w */
-const plain = (w) => typeof w === "string" ? w : w.recorded;
-
-// Typed into a shell: the recipe's own words bare, every recorded word quoted.
-const shellLine = ({ cwd, words }) =>
-  `${cwd ? `cd ${shellQuote(cwd)} && ` : ""}${words.map((w) => typeof w === "string" ? w : shellQuote(w.recorded)).join(" ")}`;
-
-// The folder and the command word list that start the agent, or null for an
-// agent without a recipe. options: tab (Claude's tab name), picker (Pi).
-/** @typedef {{ tab?: string | null, picker?: boolean }} StartOptions */
-/**
- * @param {string} agent @param {Record<string, string> | undefined} labels @param {StartOptions} [options]
- * @returns {{ cwd: string | null, argv: string[] } | null}
- */
-export function recipe(agent, labels, options) {
-  const start = startFor(agent, labels, options);
-  return start && { cwd: start.cwd, argv: start.words.map(plain) };
+// The line ↻ types to open an agent's picker, or null for an agent without
+// one. The program and --resume bare, every other word quoted.
+/** @param {string} agent @param {PickerInput} [input] @returns {string | null} */
+export function pickerLine(agent, input = {}) {
+  if (!hasPicker(agent)) return null;
+  const { cwd, argv: [program, flag, ...rest] } = PICKERS[agent](input);
+  return `${cwd ? `cd ${shellQuote(cwd)} && ` : ""}${[program, flag, ...rest.map(shellQuote)].join(" ")}`;
 }
-
-// The same start as one shell line, as recovery types it.
-/** @param {string} agent @param {Record<string, string> | undefined} labels @param {StartOptions} [options] @returns {string | null} */
-export function recoveryLine(agent, labels, options) {
-  const start = startFor(agent, labels, options);
-  return start && shellLine(start);
-}
-
-// The shell line from already parsed records: Claude's { session, tab,
-// options }, Pi's { recovery, picker }. Its keys are the agents that have a recipe.
-export const RECIPES = Object.fromEntries(Object.entries(STARTS).map(([agent, build]) => [agent, (input) => shellLine(build(input))]));

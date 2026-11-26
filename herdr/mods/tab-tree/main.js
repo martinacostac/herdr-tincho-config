@@ -18,7 +18,7 @@
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, panes, terminals, machines, run, openOverlay, theme, shared, setShared, exec, hc, home, layout } from "herdr";
-import { LABEL, RECIPES, WAKE_MS, createRecovery, remember, claudeLaunch, rememberClaudeLaunch, waking, frontProgram, holderInFront } from "./resume.js";
+import { LABEL, WAKE_MS, createRecovery, recoverable, remember, claudeLaunch, rememberClaudeLaunch, waking, frontProgram, holderInFront } from "./resume.js";
 import { claudeCandidate, processIdentity } from "./claude-polling.js";
 import { SUSPENDED, STANDIN_APP, suspension } from "./recipes.js";
 import { createSuspender } from "./suspend-policy.js";
@@ -421,12 +421,13 @@ export default class TabTree extends View {
     const on = s.active && tab.active;
     const kidsOpen = root.kids.length > 0 && !this.folded.has(tab.id);
     const held = this.heldState(p);
-    // Back at a shell prompt: ↻ recovers the agent the terminal last ran. Never
+    // Back at a shell prompt: ↻ resumes the agent from its resume report, or
+    // opens the last agent's picker without one (spec Q1). Never
     // in a stand-in: it is the main program, so it looks like a shell. Nor
     // while the suspension label is set: recovery refuses to type then.
     const local = !held && d.k === "shell" && p.terminal && !p.terminal.includes("/") && !this.suspensionLabel(p.terminal);
-    const last = local ? this.labels.get(p.terminal)?.[LABEL] : null;
-    const agent = last && RECIPES[last] ? last : null;
+    const last = local ? this.labels.get(p.terminal)?.[LABEL] ?? null : null;
+    const agent = local ? recoverable(this.labels.get(p.terminal) ?? {}, { agent: last, cwd: p.cwd }) : null;
     const hovered = this.hovered === tab.id;
     if (collapsed) {
       return h_flex().id(`tab-${tab.id}`).h(28).flex_none().justify_center().items_center().gap(3).rounded(7)
@@ -476,7 +477,7 @@ export default class TabTree extends View {
         .on_click((_e, cx) => {
           cx.stop_propagation();
           const labels = this.labels.get(p.terminal) ?? {};
-          cx.spawn(async (cx) => { await this.recovery.recover(cx, p.terminal, agent, labels, tab.named ? tab.name : null); });
+          cx.spawn(async (cx) => { await this.recovery.recover(cx, p.terminal, { agent: last, labels, tab: tab.named ? tab.name : null, cwd: p.cwd ?? null }); });
         })
         .child("↻")))
       .when(hovered, (el) => el.child(div().id(`tab-close-${tab.id}`).flex_none().p(2).rounded(4).text_color(t.dim)

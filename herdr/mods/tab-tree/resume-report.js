@@ -64,12 +64,15 @@ export function legacyReport(labels, { agent = null, cwd = null } = {}) {
   return null;
 }
 
-// The report for a terminal: its herdr.resume label, else one built from the
-// old labels.
+// The report for a terminal: its herdr.resume label, else, only while that
+// label was never written, one built from the old labels. An empty
+// herdr.resume means "nothing to resume" (a new session before its first
+// message): the old labels then name an older conversation.
 /** @param {Record<string, string> | undefined} labels @param {{ agent?: string | null, cwd?: string | null }} [options] */
 export function reportOf(labels, options) {
   if (!labels) return null;
-  return parseReport(labels[RESUME]) ?? legacyReport(labels, options);
+  if (Object.hasOwn(labels, RESUME)) return parseReport(labels[RESUME]);
+  return legacyReport(labels, options);
 }
 
 // The line ↻ types into the terminal's shell. Every word is quoted, the
